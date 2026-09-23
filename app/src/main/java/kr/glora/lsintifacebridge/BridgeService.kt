@@ -48,22 +48,15 @@ class BridgeService : Service() {
             0x97.toByte(), 0xFE.toByte(), 0x42.toByte(), 0x7C.toByte()
         )
 
-        // CANAL 1: VIBRACIÓN (Continuo)
+        // CANAL 1: VIBRACIÓN (3 velocidades físicas reales)
         private val CMD_CH1_STOP = byteArrayOf(0xD5.toByte(), 0x96.toByte(), 0x4C.toByte())
         private val CMD_CH1_L1   = byteArrayOf(0xD4.toByte(), 0x1F.toByte(), 0x5D.toByte())
         private val CMD_CH1_L2   = byteArrayOf(0xD7.toByte(), 0x84.toByte(), 0x6F.toByte())
-        private val CMD_CH1_L3   = byteArrayOf(0xD6.toByte(), 0x0D.toByte(), 0x7E.toByte())
+        private val CMD_CH1_L3   = byteArrayOf(0xD6.toByte(), 0x0D.toByte(), 0x7E.toByte()) // Máxima potencia
 
-        // CANAL 2: SUCCIÓN
+        // CANAL 2: SUCCIÓN PROFUNDA
         private val CMD_CH2_STOP = byteArrayOf(0xA5.toByte(), 0x11.toByte(), 0x3F.toByte())
-        private val CMD_CH2_L1   = byteArrayOf(0xA4.toByte(), 0x98.toByte(), 0x2E.toByte())
-        private val CMD_CH2_L2   = byteArrayOf(0xA7.toByte(), 0x03.toByte(), 0x1C.toByte()) // Succión profunda y larga
-    }
-
-    private enum class SuctionState {
-        IDLE,
-        SUCKING,
-        LOCKOUT_VENTING
+        private val CMD_CH2_L2   = byteArrayOf(0xA7.toByte(), 0x03.toByte(), 0x1C.toByte()) // Succión Nivel 2
     }
 
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -77,30 +70,27 @@ class BridgeService : Service() {
     private var currentFunscriptInput = 0
     private var lastSentCmd: ByteArray? = null
 
-    // Temporizador para detectar si el vídeo fue pausado
+    // Temporizador para apagar motores solo si se pausa el vídeo en FapTap
     private var lastPacketReceivedTime = 0L
-    private val VIDEO_PAUSE_TIMEOUT_MS = 1200L // 1.2 segundos sin datos = vídeo en pausa
+    private val VIDEO_PAUSE_TIMEOUT_MS = 1200L
 
-    // Succión larga y control de despresurización
-    private var suctionState = SuctionState.IDLE
-    private var suctionTimerStart = 0L
-    private val SUCK_PULSE_MS = 1400L       // 1.4 s de succión sostenida (más larga)
-    private val LOCKOUT_VENT_MS = 800L      // 0.8 s de despresurización obligatoria
+    // Succión activa solo en activación de script (máximo 1.4s por tirón, sin esperas de 0.8s)
+    private var isSuctionActive = false
+    private var suctionStartTime = 0L
+    private val MAX_SUCTION_TIME_MS = 1400L
 
-    // Control de alternancia BLE sin saturar la antena
-    private var lastChannelSwitchTime = 0L
-    private val CHANNEL_SWITCH_INTERVAL_MS = 120L
-    private var channelToggle = false
+    // Control de estabilidad BLE (evita reiniciar la antena en bucle)
+    private var lastVibeCommandTime = 0L
+    private val MIN_COMMAND_INTERVAL_MS = 80L
 
     private val okHttpClient = OkHttpClient.Builder()
         .pingInterval(10, TimeUnit.SECONDS)
         .build()
 
-    // Bucle de gestión de hardware cada 40ms
     private val loopRunnable = object : Runnable {
         override fun run() {
-            manageHardwareTransitions()
-            handler.postDelayed(this, 40)
+            manageHardware()
+            handler.postDelayed(this, 30)
         }
     }
 
@@ -132,7 +122,7 @@ class BridgeService : Service() {
                 handler.post(loopRunnable)
                 transmitBle(CMD_CH2_STOP, force = true)
                 transmitBle(CMD_CH1_STOP, force = true)
-                sendStatusUpdate(log = "Puente listo")
+                sendStatusUpdate(log = "Puente listo (Vib agresiva + Succión directa)")
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -141,14 +131,12 @@ class BridgeService : Service() {
             ACTION_TEST_LEVEL -> {
                 if (intent.hasExtra(EXTRA_VIBRATION_LEVEL)) {
                     val lvl = intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0).coerceIn(0, 20)
-                    currentVibrationLevel = lvl
-                    currentFunscriptInput = lvl
-                    if (lvl > 0) lastPacketReceivedTime = System.currentTimeMillis()
+                    processInput(lvl)
                 }
                 if (intent.hasExtra(EXTRA_ROTATION_LEVEL)) {
                     val rot = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0)
-                    if (rot > 0 && suctionState == SuctionState.IDLE) {
-                        startSuctionCycle(System.currentTimeMillis())
+                    if (rot > 0 && !isSuctionActive) {
+                        triggerSuction(System.currentTimeMillis())
                     }
                 }
             }
@@ -172,7 +160,7 @@ class BridgeService : Service() {
 
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText("Vibración ininterrumpida + Succión profunda")
+            .setContentText("Vibración de alta potencia + Succión sin esperas")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
             .setOngoing(true)
@@ -241,30 +229,12 @@ class BridgeService : Service() {
                 }
                 cmd.startsWith("Vibrate:", ignoreCase = true) || cmd.startsWith("Vibrate1:", ignoreCase = true) -> {
                     val rawValue = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
-                    val now = System.currentTimeMillis()
-                    
-                    lastPacketReceivedTime = now
-                    currentFunscriptInput = rawValue
-
-                    // PISO DE VIBRACIÓN CONTINUA:
-                    // Si el vídeo se está reproduciendo, nunca bajamos a 0 en los valles del movimiento.
-                    // Se mantiene en Nivel 1 continuo de fondo y escala a 2 o 3 con la intensidad.
-                    currentVibrationLevel = when {
-                        rawValue in 1..6 -> 1
-                        rawValue in 7..13 -> 2
-                        rawValue > 13 -> 3
-                        else -> 1 // Mantener velocidad 1 mínima en los valles para que no se apague
-                    }
-
-                    // Disparador de succión con cerrojo temporal
-                    if (suctionState == SuctionState.IDLE && rawValue > 0) {
-                        startSuctionCycle(now)
-                    }
+                    processInput(rawValue)
                 }
                 cmd.equals("Stop", ignoreCase = true) -> {
                     currentVibrationLevel = 0
                     currentFunscriptInput = 0
-                    suctionState = SuctionState.IDLE
+                    isSuctionActive = false
                     transmitBle(CMD_CH1_STOP, force = true)
                     transmitBle(CMD_CH2_STOP, force = true)
                     sendStatusUpdate(log = "Stop")
@@ -273,71 +243,67 @@ class BridgeService : Service() {
         }
     }
 
-    private fun startSuctionCycle(now: Long) {
-        suctionState = SuctionState.SUCKING
-        suctionTimerStart = now
-        // Emplea el comando de succión más larga y profunda (Nivel 2)
-        transmitBle(CMD_CH2_L2, force = true)
-        sendStatusUpdate(log = "Succión profunda activa (1.4s)")
+    private fun processInput(rawValue: Int) {
+        val now = System.currentTimeMillis()
+        lastPacketReceivedTime = now
+        currentFunscriptInput = rawValue
+
+        // 1. ESCALADO DE VIBRACIÓN MÁS POTENTE:
+        // Se activa con mayor fuerza en picos medios y altos:
+        currentVibrationLevel = when {
+            rawValue in 1..4 -> 1   // Suave continuo en valles (evita que se apague)
+            rawValue in 5..9 -> 2   // Potencia media
+            rawValue >= 10   -> 3   // ¡MÁXIMA POTENCIA de vibración física (Speed 3)!
+            else -> 1               // Piso mínimo mientras el vídeo sigue en reproducción
+        }
+
+        // 2. GESTIÓN DE SUCCIÓN PURAMENTE POR ACTIVACIÓN DE SCRIPT:
+        if (rawValue > 0) {
+            // Si el script tiene activación y la succión está inactiva, disparar de inmediato
+            if (!isSuctionActive) {
+                triggerSuction(now)
+            }
+        } else {
+            // En cuanto el script baja a 0, cortar succión inmediatamente (sin esperar 0.8s)
+            if (isSuctionActive) {
+                isSuctionActive = false
+                transmitBle(CMD_CH2_STOP, force = true)
+                sendStatusUpdate(log = "Succión: Script a 0 -> Válvula liberada")
+            }
+        }
     }
 
-    private fun manageHardwareTransitions() {
+    private fun triggerSuction(now: Long) {
+        isSuctionActive = true
+        suctionStartTime = now
+        transmitBle(CMD_CH2_L2, force = true)
+        sendStatusUpdate(log = "Succión profunda activa (1.4s máx)")
+    }
+
+    private fun manageHardware() {
         val now = System.currentTimeMillis()
 
-        // 1. Apagado total SOLO si el vídeo se detuvo o pausó (más de 1.2 segundos sin datos)
+        // 1. Apagado total si el vídeo se pausó realmente (más de 1.2s sin paquetes)
         if (currentVibrationLevel > 0 && (now - lastPacketReceivedTime > VIDEO_PAUSE_TIMEOUT_MS)) {
             currentVibrationLevel = 0
             currentFunscriptInput = 0
-            suctionState = SuctionState.IDLE
+            isSuctionActive = false
             transmitBle(CMD_CH1_STOP, force = true)
             transmitBle(CMD_CH2_STOP, force = true)
-            sendStatusUpdate(log = "Vídeo en pausa -> Motores apagados")
+            sendStatusUpdate(log = "Vídeo pausado -> Motores detenidos")
             return
         }
 
-        // 2. Máquina de estados de Succión
-        when (suctionState) {
-            SuctionState.SUCKING -> {
-                // Al transcurrir 1.4s de succión profunda -> Válvula abierta y reposo
-                if (now - suctionTimerStart >= SUCK_PULSE_MS) {
-                    suctionState = SuctionState.LOCKOUT_VENTING
-                    suctionTimerStart = now
-                    transmitBle(CMD_CH2_STOP, force = true)
-                    sendStatusUpdate(log = "Venteo y liberación (0.8s)")
-                }
-            }
-            SuctionState.LOCKOUT_VENTING -> {
-                // Al transcurrir los 0.8s de despresurización
-                if (now - suctionTimerStart >= LOCKOUT_VENT_MS) {
-                    if (currentFunscriptInput > 0) {
-                        startSuctionCycle(now)
-                    } else {
-                        suctionState = SuctionState.IDLE
-                    }
-                }
-            }
-            SuctionState.IDLE -> {
-                if (currentFunscriptInput > 0) {
-                    startSuctionCycle(now)
-                }
-            }
+        // 2. Tope de seguridad de 1.4s para la succión activa continua
+        if (isSuctionActive && (now - suctionStartTime >= MAX_SUCTION_TIME_MS)) {
+            isSuctionActive = false
+            transmitBle(CMD_CH2_STOP, force = true)
+            sendStatusUpdate(log = "Succión: Límite de 1.4s alcanzado -> Parada segura")
         }
 
-        // 3. Emisión equilibrada de radio BLE
-        if (suctionState == SuctionState.SUCKING) {
-            // Durante la succión alternamos cada 120ms para que la antena emita ráfagas estables
-            if (now - lastChannelSwitchTime >= CHANNEL_SWITCH_INTERVAL_MS) {
-                lastChannelSwitchTime = now
-                channelToggle = !channelToggle
-
-                if (channelToggle) {
-                    applyVibrationHardware()
-                } else {
-                    transmitBle(CMD_CH2_L2)
-                }
-            }
-        } else {
-            // Durante el reposo de succión, el 100% de la radio se dedica a la vibración continua
+        // 3. Emisión continua de vibración (sin micro-cortes)
+        if (now - lastVibeCommandTime >= MIN_COMMAND_INTERVAL_MS) {
+            lastVibeCommandTime = now
             applyVibrationHardware()
         }
     }
@@ -355,7 +321,7 @@ class BridgeService : Service() {
     private fun transmitBle(suffix: ByteArray, force: Boolean = false) {
         val adv = advertiser ?: return
 
-        // Si el comando ya está en el aire, no reiniciar la antena (evita micro-cortes)
+        // Evita reconfigurar la antena si el comando ya está transmitiéndose de forma continua
         if (!force && lastSentCmd != null && lastSentCmd!!.contentEquals(suffix)) {
             return
         }
@@ -388,7 +354,7 @@ class BridgeService : Service() {
             putExtra(EXTRA_BLE_STATUS, currentBleStatus)
             putExtra(EXTRA_LEVEL, currentVibrationLevel)
             putExtra(EXTRA_VIBRATION_LEVEL, currentVibrationLevel)
-            putExtra(EXTRA_ROTATION_LEVEL, if (suctionState == SuctionState.SUCKING) 2 else 0)
+            putExtra(EXTRA_ROTATION_LEVEL, if (isSuctionActive) 2 else 0)
             putExtra(EXTRA_LOG, log ?: "")
             setPackage(packageName)
         }
