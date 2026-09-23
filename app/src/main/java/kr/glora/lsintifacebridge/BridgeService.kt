@@ -20,6 +20,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import java.util.concurrent.TimeUnit
 
 class BridgeService : Service() {
@@ -71,11 +72,11 @@ class BridgeService : Service() {
     private var currentVibrationLevel = 0
     private var currentRotationLevel = 0
 
-    // Anti-Burst: cadencia de seguridad
+    // Anti-Burst: cadencia de alivio
     private var isVenting = false
     private var lastCycleSwitchTime = 0L
-    private val SUCK_DURATION_MS = 1200L // 1.2 s de succión continuada max
-    private val VENT_DURATION_MS = 600L  // 0.6 s de venteo obligatorio si no baja a 0
+    private val SUCK_DURATION_MS = 1200L // 1.2 s de succión máxima por pulso
+    private val VENT_DURATION_MS = 600L  // 0.6 s de despresurización obligatoria
 
     private var channelToggle = false
 
@@ -96,7 +97,7 @@ class BridgeService : Service() {
         }
         override fun onStartFailure(errorCode: Int) {
             currentBleStatus = "BLE Error: $errorCode"
-            sendStatusUpdate(log = "BLE Advertise failure: $errorCode")
+            sendStatusUpdate(log = "BLE Error: $errorCode")
         }
     }
 
@@ -116,7 +117,7 @@ class BridgeService : Service() {
                 connectWebSocket(url)
                 handler.removeCallbacks(broadcastRunnable)
                 handler.post(broadcastRunnable)
-                sendStatusUpdate(log = "Conectando bridge...")
+                sendStatusUpdate(log = "Iniciando servicio...")
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -176,32 +177,42 @@ class BridgeService : Service() {
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 currentWsStatus = "Connected"
-                sendStatusUpdate(log = "Conectado. Enviando Handshake WSDM...")
+                sendStatusUpdate(log = "Conectado. Enviando Handshake...")
                 
-                // 1. Handshake inicial obligatorio para Intiface Central Device Websocket Server
+                // Handshake WSDM inicial en texto
                 ws.send("{\"identifier\": \"LVSDevice\", \"address\": \"001122334455\", \"version\": 0}")
             }
 
+            // 1. Recepción en formato Texto
             override fun onMessage(ws: WebSocket, text: String) {
                 handleLovenseMessage(text)
             }
 
+            // 2. Recepción en formato BINARIO (el formato que usa Intiface Central para los comandos de vibración)
+            override fun onMessage(ws: WebSocket, bytes: ByteString) {
+                val decodedText = bytes.utf8()
+                handleLovenseMessage(decodedText)
+            }
+
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 currentWsStatus = "Disconnected"
-                sendStatusUpdate(log = "WebSocket desconectado: $reason")
+                sendStatusUpdate(log = "WebSocket cerrado: $reason")
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 currentWsStatus = "Error"
-                sendStatusUpdate(log = "Error conexión: ${t.message}")
+                sendStatusUpdate(log = "Fallo de conexión: ${t.message}")
             }
         })
     }
 
-    private fun handleLovenseMessage(text: String) {
-        // Muestra en la pantalla de la app cada orden en tiempo real
-        sendStatusUpdate(log = "RX: $text")
+    private fun sendLovenseResponse(msg: String) {
+        val raw = msg.toByteArray(Charsets.UTF_8)
+        val byteString = ByteString.of(raw, 0, raw.size)
+        webSocket?.send(byteString) // Enviar en binario para WSDM
+    }
 
+    private fun handleLovenseMessage(text: String) {
         val parts = text.split(";")
         for (part in parts) {
             val cmd = part.trim()
@@ -209,42 +220,38 @@ class BridgeService : Service() {
 
             when {
                 cmd.equals("DeviceType", ignoreCase = true) -> {
-                    // Responder con terminación estricta de punto y coma
-                    webSocket?.send("P:11:001122334455;\r\n")
-                    sendStatusUpdate(log = "TX: Lovense Edge (P:11)")
+                    sendLovenseResponse("P:11:001122334455;\r\n")
+                    sendStatusUpdate(log = "Handshake OK: Identificado P:11")
                 }
                 cmd.equals("Battery", ignoreCase = true) -> {
-                    webSocket?.send("95;\r\n")
+                    sendLovenseResponse("90;\r\n")
                 }
                 cmd.startsWith("Vibrate:", ignoreCase = true) -> {
-                    val value = (cmd.substringAfter(":").toIntOrNull() ?: 0).coerceIn(0, 20)
+                    val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
                     
-                    // VINCULACIÓN CON EL FUNSCRIPT:
-                    // La señal del script mueve la vibración Y la succión al mismo ritmo
+                    // Sincronización dual: Funscript mueve vibración y succión
                     currentVibrationLevel = value
                     currentRotationLevel = value
                     
-                    if (value == 0) {
-                        isVenting = false // Si el Funscript toca suelo, libera el vacío inmediatamente
-                    }
-                    sendStatusUpdate()
+                    if (value == 0) isVenting = false
+                    sendStatusUpdate(log = "RX: Vibrate:$value")
                 }
                 cmd.startsWith("Vibrate1:", ignoreCase = true) -> {
-                    val value = (cmd.substringAfter(":").toIntOrNull() ?: 0).coerceIn(0, 20)
+                    val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
                     currentVibrationLevel = value
-                    sendStatusUpdate()
+                    sendStatusUpdate(log = "RX: Vibrate1:$value")
                 }
                 cmd.startsWith("Vibrate2:", ignoreCase = true) || cmd.startsWith("Rotate:", ignoreCase = true) -> {
-                    val value = (cmd.substringAfter(":").toIntOrNull() ?: 0).coerceIn(0, 20)
+                    val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
                     currentRotationLevel = value
                     if (value == 0) isVenting = false
-                    sendStatusUpdate()
+                    sendStatusUpdate(log = "RX: Suct/Rot:$value")
                 }
                 cmd.equals("Stop", ignoreCase = true) -> {
                     currentVibrationLevel = 0
                     currentRotationLevel = 0
                     isVenting = false
-                    sendStatusUpdate()
+                    sendStatusUpdate(log = "RX: Stop")
                 }
             }
         }
@@ -261,18 +268,18 @@ class BridgeService : Service() {
             else -> CMD_CH1_L3
         }
 
-        // Canal 2: Succión con escape y sincronización
+        // Canal 2: Succión protegida
         val ch2Cmd: ByteArray = if (currentRotationLevel == 0) {
             isVenting = false
             lastCycleSwitchTime = now
-            CMD_CH2_STOP // Abre la válvula: libera el aire
+            CMD_CH2_STOP
         } else {
             if (isVenting) {
                 if (now - lastCycleSwitchTime >= VENT_DURATION_MS) {
                     isVenting = false
                     lastCycleSwitchTime = now
                 }
-                CMD_CH2_STOP // Fase de descanso / alivio
+                CMD_CH2_STOP
             } else {
                 if (now - lastCycleSwitchTime >= SUCK_DURATION_MS) {
                     isVenting = true
