@@ -77,7 +77,7 @@ class BridgeService : Service() {
     // Succión activa solo en activación de script (máximo 1.4s por tirón, sin esperas de 0.8s)
     private var isSuctionActive = false
     private var suctionStartTime = 0L
-    private val MAX_SUCTION_TIME_MS = 1400L
+    private val MAX_SUCTION_TIME_MS = 3000L
 
     // Control de estabilidad BLE (evita reiniciar la antena en bucle)
     private var lastVibeCommandTime = 0L
