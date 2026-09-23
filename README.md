@@ -105,3 +105,19 @@ On Windows PowerShell:
 ```powershell
 .\gradlew.bat :app:assembleDebug
 ```
+
+
+# LS-Intiface-Bridge
+
+An Android bridge service designed to interface teledildonic client applications (such as FapTap) and Intiface Central (Buttplug) with LoveSpouse and MuSe BLE hardware via continuous, dual-channel GAP broadcast engineering.
+
+## How It Works
+
+### End-to-End Pipeline
+* **Intiface Central to Android Bridge:** Intiface Central exposes a Device WebSocket Server (`ws://<PC_IP>:54817`) implementing Buttplug's WSDM specification. The Android bridge connects to this endpoint, completes the initial device identification handshake, and ingests incoming actuation instructions formatted as raw binary frames.
+* **Android Bridge to Hardware:** The application intercepts the Lovense commands, decouples them into distinct physical hardware channels, and broadcasts 11-byte BroadLink Fastcon BLE legacy advertising packets (Company Identifier `0xFFF0`) across advertising channels 37, 38, and 39 to drive the toy's onboard PWM motor controllers.
+
+### Actuation & Channel Architecture
+* **Channel 1 (Continuous Vibration):** Ingested values are normalized across three continuous physical power levels (`0xD41F5D`, `0xD7846F`, `0xD60D7E`). The pipeline enforces an uninterrupted baseline floor during active playback, preventing the motor from cutting out or stuttering during Funscript valley transitions, while strictly suppressing firmware-level burst opcodes (`0xE0B82A`).
+* **Channel 2 (Reactive Deep Suction):** Vacuum actuation is driven by deep suction pulses (`0xA7031C`) exclusively during script activation peaks. Suction run-time is bounded by a 1.4-second safety ceiling to prevent excessive negative pressure, and immediately de-energizes (`0xA5113F`) the moment the script returns to zero to equalize atmospheric pressure without artificial cooldown delays.
+* **Stream Maintenance & Watchdog:** When playback is paused or packet arrival halts for more than 1.2 seconds, the pipeline suspends active channels and broadcasts global standby frames (`0xE5157D`) to cleanly stop all onboard actuators.
