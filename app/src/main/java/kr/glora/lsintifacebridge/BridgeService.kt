@@ -41,22 +41,20 @@ class BridgeService : Service() {
         private const val CHANNEL_ID = "ls_bridge_channel"
         private const val NOTIFICATION_ID = 1001
 
-        // Prefijo BroadLink Fastcon para LoveSpouse / MuSe
         private val PREFIX = byteArrayOf(
             0x6D.toByte(), 0xB6.toByte(), 0x43.toByte(), 0xCE.toByte(),
             0x97.toByte(), 0xFE.toByte(), 0x42.toByte(), 0x7C.toByte()
         )
 
-        // Parada total
         private val CMD_ALL_STOP = byteArrayOf(0xE5.toByte(), 0x15.toByte(), 0x7D.toByte())
 
-        // CANAL 1: VIBRACIÓN (100% continuo, sin ráfagas ni códigos 0xE0B82A)
+        // CANAL 1: VIBRACIÓN (Continuo sin ráfagas)
         private val CMD_CH1_STOP = byteArrayOf(0xD5.toByte(), 0x96.toByte(), 0x4C.toByte())
         private val CMD_CH1_L1   = byteArrayOf(0xD4.toByte(), 0x1F.toByte(), 0x5D.toByte())
         private val CMD_CH1_L2   = byteArrayOf(0xD7.toByte(), 0x84.toByte(), 0x6F.toByte())
         private val CMD_CH1_L3   = byteArrayOf(0xD6.toByte(), 0x0D.toByte(), 0x7E.toByte())
 
-        // CANAL 2: SUCCIÓN / PRESIÓN
+        // CANAL 2: SUCCIÓN
         private val CMD_CH2_STOP = byteArrayOf(0xA5.toByte(), 0x11.toByte(), 0x3F.toByte())
         private val CMD_CH2_L1   = byteArrayOf(0xA4.toByte(), 0x98.toByte(), 0x2E.toByte())
         private val CMD_CH2_L2   = byteArrayOf(0xA7.toByte(), 0x03.toByte(), 0x1C.toByte())
@@ -70,23 +68,21 @@ class BridgeService : Service() {
     private var currentWsStatus: String = "Disconnected"
     private var currentBleStatus: String = "Ready"
 
-    // Niveles de potencia (0 a 20 estilo Lovense)
     private var currentVibrationLevel = 0
     private var currentRotationLevel = 0
 
-    // Temporizador de venteo / seguridad (Anti-Burst Pacer)
+    // Anti-Burst: cadencia de seguridad
     private var isVenting = false
     private var lastCycleSwitchTime = 0L
-    private val SUCK_DURATION_MS = 1000L // Máximo 1.0 s de succión por ciclo
-    private val VENT_DURATION_MS = 800L  // 0.8 s de apertura de válvula obligatoria
+    private val SUCK_DURATION_MS = 1200L // 1.2 s de succión continuada max
+    private val VENT_DURATION_MS = 600L  // 0.6 s de venteo obligatorio si no baja a 0
 
-    private var channelToggle = false // Alternar paquetes BLE entre Canal 1 y Canal 2
+    private var channelToggle = false
 
     private val okHttpClient = OkHttpClient.Builder()
         .pingInterval(10, TimeUnit.SECONDS)
         .build()
 
-    // Bucle BLE cada 50ms para evitar el watchdog de 250ms del hardware
     private val broadcastRunnable = object : Runnable {
         override fun run() {
             sendHardwareCycle()
@@ -98,7 +94,6 @@ class BridgeService : Service() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             currentBleStatus = "Advertising Active"
         }
-
         override fun onStartFailure(errorCode: Int) {
             currentBleStatus = "BLE Error: $errorCode"
             sendStatusUpdate(log = "BLE Advertise failure: $errorCode")
@@ -121,7 +116,7 @@ class BridgeService : Service() {
                 connectWebSocket(url)
                 handler.removeCallbacks(broadcastRunnable)
                 handler.post(broadcastRunnable)
-                sendStatusUpdate(log = "Bridge iniciado hacia $url")
+                sendStatusUpdate(log = "Conectando bridge...")
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -156,7 +151,7 @@ class BridgeService : Service() {
 
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText("Transfiriendo comandos sin ráfagas")
+            .setContentText("Bridge activo y sincronizado")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
             .setOngoing(true)
@@ -168,7 +163,7 @@ class BridgeService : Service() {
     private fun connectWebSocket(url: String) {
         disconnectWebSocket()
         currentWsStatus = "Connecting..."
-        sendStatusUpdate(log = "Conectando a Intiface: $url")
+        sendStatusUpdate(log = "Conectando a: $url")
 
         val request = try {
             Request.Builder().url(url).build()
@@ -181,7 +176,10 @@ class BridgeService : Service() {
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 currentWsStatus = "Connected"
-                sendStatusUpdate(log = "Conectado a Intiface Central")
+                sendStatusUpdate(log = "Conectado. Enviando Handshake WSDM...")
+                
+                // 1. Handshake inicial obligatorio para Intiface Central Device Websocket Server
+                ws.send("{\"identifier\": \"LVSDevice\", \"address\": \"001122334455\", \"version\": 0}")
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -190,17 +188,20 @@ class BridgeService : Service() {
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 currentWsStatus = "Disconnected"
-                sendStatusUpdate(log = "WebSocket cerrado: $reason")
+                sendStatusUpdate(log = "WebSocket desconectado: $reason")
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 currentWsStatus = "Error"
-                sendStatusUpdate(log = "Fallo de conexión: ${t.message}")
+                sendStatusUpdate(log = "Error conexión: ${t.message}")
             }
         })
     }
 
     private fun handleLovenseMessage(text: String) {
+        // Muestra en la pantalla de la app cada orden en tiempo real
+        sendStatusUpdate(log = "RX: $text")
+
         val parts = text.split(";")
         for (part in parts) {
             val cmd = part.trim()
@@ -208,35 +209,41 @@ class BridgeService : Service() {
 
             when {
                 cmd.equals("DeviceType", ignoreCase = true) -> {
-                    // Reportar como Lovense Edge (P:11) para habilitar 2 motores independientes
-                    webSocket?.send("P:11:001122334455\r\n")
+                    // Responder con terminación estricta de punto y coma
+                    webSocket?.send("P:11:001122334455;\r\n")
+                    sendStatusUpdate(log = "TX: Lovense Edge (P:11)")
                 }
                 cmd.equals("Battery", ignoreCase = true) -> {
-                    webSocket?.send("90;\r\n")
+                    webSocket?.send("95;\r\n")
                 }
                 cmd.startsWith("Vibrate:", ignoreCase = true) -> {
-                    val value = cmd.substringAfter(":").toIntOrNull() ?: 0
-                    currentVibrationLevel = value.coerceIn(0, 20)
+                    val value = (cmd.substringAfter(":").toIntOrNull() ?: 0).coerceIn(0, 20)
+                    
+                    // VINCULACIÓN CON EL FUNSCRIPT:
+                    // La señal del script mueve la vibración Y la succión al mismo ritmo
+                    currentVibrationLevel = value
+                    currentRotationLevel = value
+                    
+                    if (value == 0) {
+                        isVenting = false // Si el Funscript toca suelo, libera el vacío inmediatamente
+                    }
                     sendStatusUpdate()
                 }
                 cmd.startsWith("Vibrate1:", ignoreCase = true) -> {
-                    val value = cmd.substringAfter(":").toIntOrNull() ?: 0
-                    currentVibrationLevel = value.coerceIn(0, 20)
+                    val value = (cmd.substringAfter(":").toIntOrNull() ?: 0).coerceIn(0, 20)
+                    currentVibrationLevel = value
                     sendStatusUpdate()
                 }
-                cmd.startsWith("Vibrate2:", ignoreCase = true) -> {
-                    val value = cmd.substringAfter(":").toIntOrNull() ?: 0
-                    currentRotationLevel = value.coerceIn(0, 20)
-                    sendStatusUpdate()
-                }
-                cmd.startsWith("Rotate:", ignoreCase = true) -> {
-                    val value = cmd.substringAfter(":").toIntOrNull() ?: 0
-                    currentRotationLevel = value.coerceIn(0, 20)
+                cmd.startsWith("Vibrate2:", ignoreCase = true) || cmd.startsWith("Rotate:", ignoreCase = true) -> {
+                    val value = (cmd.substringAfter(":").toIntOrNull() ?: 0).coerceIn(0, 20)
+                    currentRotationLevel = value
+                    if (value == 0) isVenting = false
                     sendStatusUpdate()
                 }
                 cmd.equals("Stop", ignoreCase = true) -> {
                     currentVibrationLevel = 0
                     currentRotationLevel = 0
+                    isVenting = false
                     sendStatusUpdate()
                 }
             }
@@ -246,7 +253,7 @@ class BridgeService : Service() {
     private fun sendHardwareCycle() {
         val now = System.currentTimeMillis()
 
-        // 1. Comando Canal 1 (Vibración)
+        // Canal 1: Vibración
         val ch1Cmd = when {
             currentVibrationLevel == 0 -> CMD_CH1_STOP
             currentVibrationLevel in 1..6 -> CMD_CH1_L1
@@ -254,18 +261,18 @@ class BridgeService : Service() {
             else -> CMD_CH1_L3
         }
 
-        // 2. Comando Canal 2 (Succión con Anti-Burst y Venteo)
+        // Canal 2: Succión con escape y sincronización
         val ch2Cmd: ByteArray = if (currentRotationLevel == 0) {
             isVenting = false
             lastCycleSwitchTime = now
-            CMD_CH2_STOP
+            CMD_CH2_STOP // Abre la válvula: libera el aire
         } else {
             if (isVenting) {
                 if (now - lastCycleSwitchTime >= VENT_DURATION_MS) {
                     isVenting = false
                     lastCycleSwitchTime = now
                 }
-                CMD_CH2_STOP // Válvula abierta, aire entrando
+                CMD_CH2_STOP // Fase de descanso / alivio
             } else {
                 if (now - lastCycleSwitchTime >= SUCK_DURATION_MS) {
                     isVenting = true
@@ -281,13 +288,11 @@ class BridgeService : Service() {
             }
         }
 
-        // Si ambos están en 0, mantener parada general
         if (currentVibrationLevel == 0 && currentRotationLevel == 0) {
             transmitBle(CMD_ALL_STOP)
             return
         }
 
-        // Alternar la emisión de paquetes en cada ciclo de 50ms
         channelToggle = !channelToggle
         if (channelToggle) {
             transmitBle(ch1Cmd)
@@ -316,9 +321,7 @@ class BridgeService : Service() {
         try {
             adv.stopAdvertising(bleCallback)
             adv.startAdvertising(settings, data, bleCallback)
-        } catch (e: Exception) {
-            // Manejo de reinicio rápido en el stack BLE
-        }
+        } catch (ignored: Exception) {}
     }
 
     private fun sendStatusUpdate(log: String? = null) {
