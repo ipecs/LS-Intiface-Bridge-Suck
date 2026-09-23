@@ -21,6 +21,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import okio.ByteString.Companion.encodeUtf8
 import java.util.concurrent.TimeUnit
 
 class BridgeService : Service() {
@@ -183,12 +184,12 @@ class BridgeService : Service() {
                 ws.send("{\"identifier\": \"LVSDevice\", \"address\": \"001122334455\", \"version\": 0}")
             }
 
-            // 1. Recepción en formato Texto
+            // 1. Recepción de tramas en formato Texto
             override fun onMessage(ws: WebSocket, text: String) {
                 handleLovenseMessage(text)
             }
 
-            // 2. Recepción en formato BINARIO (el formato que usa Intiface Central para los comandos de vibración)
+            // 2. Recepción de tramas en formato BINARIO (usado por Intiface Central)
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
                 val decodedText = bytes.utf8()
                 handleLovenseMessage(decodedText)
@@ -207,9 +208,9 @@ class BridgeService : Service() {
     }
 
     private fun sendLovenseResponse(msg: String) {
-        val raw = msg.toByteArray(Charsets.UTF_8)
-        val byteString = ByteString.of(raw, 0, raw.size)
-        webSocket?.send(byteString) // Enviar en binario para WSDM
+        // Codificación moderna en Kotlin compatible con Okio 3+
+        val byteString = msg.encodeUtf8()
+        webSocket?.send(byteString)
     }
 
     private fun handleLovenseMessage(text: String) {
@@ -229,7 +230,7 @@ class BridgeService : Service() {
                 cmd.startsWith("Vibrate:", ignoreCase = true) -> {
                     val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
                     
-                    // Sincronización dual: Funscript mueve vibración y succión
+                    // Sincronización dual: Funscript mueve vibración y succión al unísono
                     currentVibrationLevel = value
                     currentRotationLevel = value
                     
