@@ -48,7 +48,7 @@ class BridgeService : Service() {
             0x97.toByte(), 0xFE.toByte(), 0x42.toByte(), 0x7C.toByte()
         )
 
-        // CANAL 1: VIBRACIÓN (Puro continuo sin saltos)
+        // CANAL 1: VIBRACIÓN
         private val CMD_CH1_STOP = byteArrayOf(0xD5.toByte(), 0x96.toByte(), 0x4C.toByte())
         private val CMD_CH1_L1   = byteArrayOf(0xD4.toByte(), 0x1F.toByte(), 0x5D.toByte())
         private val CMD_CH1_L2   = byteArrayOf(0xD7.toByte(), 0x84.toByte(), 0x6F.toByte())
@@ -60,9 +60,9 @@ class BridgeService : Service() {
     }
 
     private enum class SuctionState {
-        IDLE,             // Esperando a que el script envíe una señal
-        SUCKING,          // Succión activa (bloquea ráfagas intermedias)
-        LOCKOUT_VENTING   // Válvula abierta soltando aire (bloquea nuevas señales)
+        IDLE,             // Esperando señal
+        SUCKING,          // Succión activa
+        LOCKOUT_VENTING   // Válvula abierta liberando aire
     }
 
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -80,23 +80,25 @@ class BridgeService : Service() {
     private var lastNonZeroTime = 0L
     private val ZERO_HOLD_MS = 250L
 
-    // CERROJO Y TEMPORIZADORES DE SUCCIÓN (Modificables)
+    // CICLO DE SUCCIÓN ESTABLE
     private var suctionState = SuctionState.IDLE
     private var suctionTimerStart = 0L
-    private val SUCK_PULSE_MS = 1500L       // Tiempo de succión activa (puedes subirlo a 2000L si quieres más tiempo)
-    private val LOCKOUT_VENT_MS = 1000L     // Tiempo de venteo obligatorio para soltar el aire
+    private val SUCK_PULSE_MS = 1800L       // 1.8 segundos de succión firme
+    private val LOCKOUT_VENT_MS = 1200L     // 1.2 segundos de venteo para que entre aire
 
+    // ALTERNANCIA SEGURA A 150MS (Evita que el juguete se desconecte)
+    private var lastChannelSwitchTime = 0L
+    private val SAFE_SWITCH_INTERVAL_MS = 150L
     private var suctionToggle = false
 
     private val okHttpClient = OkHttpClient.Builder()
         .pingInterval(10, TimeUnit.SECONDS)
         .build()
 
-    // Bucle gestor de estados (cada 40ms)
     private val loopRunnable = object : Runnable {
         override fun run() {
             manageStateTransitions()
-            handler.postDelayed(this, 40)
+            handler.postDelayed(this, 30)
         }
     }
 
@@ -128,7 +130,7 @@ class BridgeService : Service() {
                 handler.post(loopRunnable)
                 transmitBle(CMD_CH2_STOP, force = true)
                 applyVibrationHardware(force = true)
-                sendStatusUpdate(log = "Puente activo: Vib continua + Succión protegida")
+                sendStatusUpdate(log = "Puente activo (Estable a 150ms)")
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -168,7 +170,7 @@ class BridgeService : Service() {
 
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText("Vibración + Succión con Cerrojo Anti-Dolor")
+            .setContentText("Vibración + Succión Estable")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
             .setOngoing(true)
@@ -240,7 +242,7 @@ class BridgeService : Service() {
                     val now = System.currentTimeMillis()
                     currentFunscriptInput = rawValue
 
-                    // 1. Manejo de Vibración (Inercia suave continua)
+                    // 1. Manejo de Vibración
                     if (rawValue > 0) {
                         lastNonZeroTime = now
                         currentVibrationLevel = rawValue
@@ -250,9 +252,8 @@ class BridgeService : Service() {
                         }
                     }
 
-                    // 2. Disparador de Succión:
-                    // SOLO si la máquina está en IDLE arranca un nuevo ciclo
-                    if (suctionState == SuctionState.IDLE && rawValue > 0) {
+                    // 2. Disparador de Succión (solo si está en reposo)
+                    if (suctionState == SuctionState.IDLE && rawValue >= 5) {
                         startSuctionCycle(now)
                     }
                 }
@@ -260,8 +261,8 @@ class BridgeService : Service() {
                     currentVibrationLevel = 0
                     currentFunscriptInput = 0
                     suctionState = SuctionState.IDLE
-                    transmitBle(CMD_CH1_STOP)
-                    transmitBle(CMD_CH2_STOP)
+                    transmitBle(CMD_CH1_STOP, force = true)
+                    transmitBle(CMD_CH2_STOP, force = true)
                     sendStatusUpdate(log = "Stop")
                 }
             }
@@ -271,33 +272,33 @@ class BridgeService : Service() {
     private fun startSuctionCycle(now: Long) {
         suctionState = SuctionState.SUCKING
         suctionTimerStart = now
+        lastChannelSwitchTime = now
+        suctionToggle = false
         transmitBle(CMD_CH2_L1, force = true)
-        sendStatusUpdate(log = "Succión: Pulso activo (${SUCK_PULSE_MS}ms)")
+        sendStatusUpdate(log = "Succión: Activa (${SUCK_PULSE_MS}ms)")
     }
 
     private fun manageStateTransitions() {
         val now = System.currentTimeMillis()
 
-        // 1. Apagar vibración únicamente si el vídeo lleva más de 250ms detenido
+        // 1. Inercia de vibración
         if (currentVibrationLevel > 0 && (now - lastNonZeroTime > ZERO_HOLD_MS)) {
             currentVibrationLevel = 0
         }
 
-        // 2. Máquina de estados de Succión
+        // 2. Ciclo de tiempo de la Succión
         when (suctionState) {
             SuctionState.SUCKING -> {
-                // Al terminar el tiempo de succión -> Pasa a VENTEO OBLIGATORIO
                 if (now - suctionTimerStart >= SUCK_PULSE_MS) {
                     suctionState = SuctionState.LOCKOUT_VENTING
                     suctionTimerStart = now
                     transmitBle(CMD_CH2_STOP, force = true) // Válvula abierta, aire entra
-                    sendStatusUpdate(log = "Succión: Venteo y bloqueo (${LOCKOUT_VENT_MS}ms)")
+                    sendStatusUpdate(log = "Succión: Venteo (${LOCKOUT_VENT_MS}ms)")
                 }
             }
             SuctionState.LOCKOUT_VENTING -> {
-                // Al terminar el tiempo de venteo -> Cerrojo liberado
                 if (now - suctionTimerStart >= LOCKOUT_VENT_MS) {
-                    if (currentFunscriptInput > 0) {
+                    if (currentFunscriptInput >= 5) {
                         startSuctionCycle(now)
                     } else {
                         suctionState = SuctionState.IDLE
@@ -305,23 +306,25 @@ class BridgeService : Service() {
                 }
             }
             SuctionState.IDLE -> {
-                if (currentFunscriptInput > 0) {
+                if (currentFunscriptInput >= 5) {
                     startSuctionCycle(now)
                 }
             }
         }
 
-        // 3. Emisión de paquetes de radio
+        // 3. Emisión de paquetes segura (cada 150ms exactos, sin saturar)
         if (suctionState == SuctionState.SUCKING) {
-            // Durante la succión activa alternamos rápidamente para alimentar ambos motores
-            suctionToggle = !suctionToggle
-            if (suctionToggle) {
-                applyVibrationHardware()
-            } else {
-                transmitBle(CMD_CH2_L1)
+            if (now - lastChannelSwitchTime >= SAFE_SWITCH_INTERVAL_MS) {
+                lastChannelSwitchTime = now
+                suctionToggle = !suctionToggle
+                if (suctionToggle) {
+                    applyVibrationHardware()
+                } else {
+                    transmitBle(CMD_CH2_L1) // Mantiene viva la succión sin saturar la antena
+                }
             }
         } else {
-            // Cuando la succión está en reposo o despresurizando, el 100% de la radio es para vibración
+            // Fuera de la succión: radio 100% dedicada a la vibración
             applyVibrationHardware()
         }
     }
@@ -329,8 +332,8 @@ class BridgeService : Service() {
     private fun applyVibrationHardware(force: Boolean = false) {
         val cmd = when {
             currentVibrationLevel == 0 -> CMD_CH1_STOP
-            currentVibrationLevel in 1..6 -> CMD_CH1_L1
-            currentVibrationLevel in 7..13 -> CMD_CH1_L2
+            currentVibrationLevel in 1..4 -> CMD_CH1_L1
+            currentVibrationLevel in 5..9 -> CMD_CH1_L2
             else -> CMD_CH1_L3
         }
         transmitBle(cmd, force)
