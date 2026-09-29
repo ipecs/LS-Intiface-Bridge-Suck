@@ -62,17 +62,12 @@ class BridgeService : Service() {
         private val CMD_CH2_L2   = byteArrayOf(0xA7.toByte(), 0x03.toByte(), 0x1C.toByte())
         private val CMD_CH2_L3   = byteArrayOf(0xA6.toByte(), 0x8A.toByte(), 0x0D.toByte())
 
-        // ============ UMBRALES DE PEAK PARA SUCCIÓN ============
-        // Peak 0..4  → sin succión
-        // Peak 5..9  → Nivel 1
-        // Peak 10..14 → Nivel 2
-        // Peak 15..20 → Nivel 3
+        // ============ UMBRALES DE PEAK ============
         private const val SUCTION_MIN_PEAK = 5
         private const val SUCTION_L2_PEAK  = 10
         private const val SUCTION_L3_PEAK  = 15
 
-        // ============ DURACIONES POR NIVEL ============
-        // A mayor nivel → más segundos de vacío y venteo proporcional
+        // ============ DURACIONES POR NIVEL (ms) ============
         private const val SUCK_L1_MS = 1200L
         private const val SUCK_L2_MS = 2000L
         private const val SUCK_L3_MS = 3000L
@@ -80,6 +75,15 @@ class BridgeService : Service() {
         private const val VENT_L1_MS = 600L
         private const val VENT_L2_MS = 800L
         private const val VENT_L3_MS = 1000L
+
+        // ============ PEAK-HOLD ============
+        // Cuando un ciclo termina, en vez de mirar el peak "instantáneo"
+        // (que puede estar en un valle), usamos el máximo visto en esta ventana.
+        private const val PEAK_HOLD_MS = 500L
+
+        // Pequeña pausa entre ciclos para evitar arranques consecutivos
+        // por un peak que ya estaba decayendo.
+        private const val CYCLE_COOLDOWN_MS = 100L
     }
 
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -92,10 +96,16 @@ class BridgeService : Service() {
     private var currentVibrationLevel = 0
     private var currentRotationLevel = 0
 
-    // ---- Estado del ciclo de succión ----
+    // ---- Estado del ciclo de succión LATCHEADO ----
+    private var cycleActive = false
+    private var latchedLevel = 0
     private var isVenting = false
     private var lastCycleSwitchTime = 0L
-    private var currentSuctionLevel = 0   // 0 = inactivo, 1/2/3 = nivel actual
+    private var cycleJustEndedTime = 0L
+
+    // ---- Peak-Hold ----
+    private var peakHoldValue = 0
+    private var peakHoldTime = 0L
 
     private var channelToggle = false
 
@@ -136,7 +146,7 @@ class BridgeService : Service() {
                 connectWebSocket(url)
                 handler.removeCallbacks(broadcastRunnable)
                 handler.post(broadcastRunnable)
-                sendStatusUpdate(log = "Iniciando servicio...")
+                sendStatusUpdate(log = "Iniciando servicio (latch activo)...")
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -147,7 +157,9 @@ class BridgeService : Service() {
                     currentVibrationLevel = intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0).coerceIn(0, 20)
                 }
                 if (intent.hasExtra(EXTRA_ROTATION_LEVEL)) {
-                    currentRotationLevel = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0).coerceIn(0, 20)
+                    val v = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0).coerceIn(0, 20)
+                    currentRotationLevel = v
+                    recordPeak(v, System.currentTimeMillis())
                 }
                 sendStatusUpdate(log = "Manual: Vibe=$currentVibrationLevel, Suct=$currentRotationLevel")
             }
@@ -171,7 +183,7 @@ class BridgeService : Service() {
 
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText("Bridge activo (3 niveles de succión)")
+            .setContentText("Bridge activo (succión latch)")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
             .setOngoing(true)
@@ -242,8 +254,8 @@ class BridgeService : Service() {
                 cmd.startsWith("Vibrate:", ignoreCase = true) -> {
                     val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
                     currentVibrationLevel = value
-                    currentRotationLevel = value   // Modo dual: mismo peak mueve ambos canales
-                    if (value == 0) isVenting = false
+                    currentRotationLevel = value   // Modo dual
+                    recordPeak(value, System.currentTimeMillis())
                     sendStatusUpdate(log = "RX: Vibrate:$value")
                 }
                 cmd.startsWith("Vibrate1:", ignoreCase = true) -> {
@@ -254,14 +266,16 @@ class BridgeService : Service() {
                 cmd.startsWith("Vibrate2:", ignoreCase = true) || cmd.startsWith("Rotate:", ignoreCase = true) -> {
                     val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
                     currentRotationLevel = value
-                    if (value == 0) isVenting = false
+                    recordPeak(value, System.currentTimeMillis())
                     sendStatusUpdate(log = "RX: Suct/Rot:$value")
                 }
                 cmd.equals("Stop", ignoreCase = true) -> {
                     currentVibrationLevel = 0
                     currentRotationLevel = 0
+                    cycleActive = false
+                    latchedLevel = 0
                     isVenting = false
-                    currentSuctionLevel = 0
+                    peakHoldValue = 0
                     sendStatusUpdate(log = "RX: Stop")
                 }
             }
@@ -269,9 +283,28 @@ class BridgeService : Service() {
     }
 
     /**
-     * Devuelve el nivel (0..3) según el peak actual.
-     * 0 = sin succión.
+     * Registra el peak para el "peak-hold".
+     * Solo actualiza el valor de referencia si:
+     *  - el nuevo valor es mayor o igual al actual, o
+     *  - ha pasado suficiente tiempo desde la última actualización
+     *    (para que la ventana se deslice hacia abajo sola).
      */
+    private fun recordPeak(value: Int, now: Long) {
+        val expired = (now - peakHoldTime) > PEAK_HOLD_MS
+        if (expired || value >= peakHoldValue) {
+            peakHoldValue = value
+            peakHoldTime = now
+        }
+    }
+
+    /**
+     * Devuelve el nivel de succión efectivo, usando el peak-hold.
+     * Si el peak-hold expiró (silencio prolongado), equivale al valor actual.
+     */
+    private fun effectivePeak(now: Long): Int {
+        return if (now - peakHoldTime > PEAK_HOLD_MS) 0 else peakHoldValue
+    }
+
     private fun levelFromPeak(peak: Int): Int = when {
         peak >= SUCTION_L3_PEAK -> 3
         peak >= SUCTION_L2_PEAK -> 2
@@ -308,46 +341,52 @@ class BridgeService : Service() {
             else -> CMD_CH1_L3
         }
 
-        // ---- Canal 2: Succión dependiente de peaks ----
-        val targetLevel = levelFromPeak(currentRotationLevel)
+        // ---- Canal 2: Succión con latch ----
+        val ch2Cmd: ByteArray = if (!cycleActive) {
+            // Sin ciclo activo → ¿arrancamos uno?
+            val coolingDown = (now - cycleJustEndedTime) < CYCLE_COOLDOWN_MS
+            val peak = effectivePeak(now)
+            val level = levelFromPeak(peak)
 
-        val ch2Cmd: ByteArray = if (targetLevel == 0) {
-            // Peak por debajo del mínimo: sin succión, ciclo reseteado
-            isVenting = false
-            currentSuctionLevel = 0
-            lastCycleSwitchTime = now
-            CMD_CH2_STOP
-        } else {
-            // Si el peak sube de nivel → upgrade inmediato y reinicio de ciclo
-            if (targetLevel > currentSuctionLevel) {
-                currentSuctionLevel = targetLevel
+            if (coolingDown || level == 0) {
+                CMD_CH2_STOP
+            } else {
+                // Arranca ciclo latcheando el nivel actual
+                cycleActive = true
+                latchedLevel = level
                 isVenting = false
                 lastCycleSwitchTime = now
+                suctionCmdFor(level)
             }
-            // Si el peak baja de nivel → dejamos terminar el ciclo actual
-            // (no bajamos durante SUCK para no cortar el vacío a medias)
-
-            val suckMs = suckDurationFor(currentSuctionLevel)
-            val ventMs = ventDurationFor(currentSuctionLevel)
+        } else {
+            // Ciclo activo: ignoramos todos los peaks hasta terminarlo
+            val suckMs = suckDurationFor(latchedLevel)
+            val ventMs = ventDurationFor(latchedLevel)
 
             if (isVenting) {
                 if (now - lastCycleSwitchTime >= ventMs) {
+                    // Ciclo completo → cerramos y dejamos que la próxima iteración decida
+                    cycleActive = false
+                    latchedLevel = 0
                     isVenting = false
-                    lastCycleSwitchTime = now
+                    cycleJustEndedTime = now
+                    CMD_CH2_STOP
+                } else {
+                    CMD_CH2_STOP
                 }
-                CMD_CH2_STOP
             } else {
                 if (now - lastCycleSwitchTime >= suckMs) {
+                    // SUCK completado → pasamos a VENT
                     isVenting = true
                     lastCycleSwitchTime = now
                     CMD_CH2_STOP
                 } else {
-                    suctionCmdFor(currentSuctionLevel)
+                    suctionCmdFor(latchedLevel)
                 }
             }
         }
 
-        if (currentVibrationLevel == 0 && currentRotationLevel == 0) {
+        if (currentVibrationLevel == 0 && currentRotationLevel == 0 && !cycleActive) {
             transmitBle(CMD_ALL_STOP)
             return
         }
@@ -389,7 +428,7 @@ class BridgeService : Service() {
             putExtra(EXTRA_BLE_STATUS, currentBleStatus)
             putExtra(EXTRA_LEVEL, currentVibrationLevel)
             putExtra(EXTRA_VIBRATION_LEVEL, currentVibrationLevel)
-            putExtra(EXTRA_ROTATION_LEVEL, currentSuctionLevel)  // reporta el nivel real de succión (0..3)
+            putExtra(EXTRA_ROTATION_LEVEL, latchedLevel)
             putExtra(EXTRA_LOG, log ?: "")
             setPackage(packageName)
         }
