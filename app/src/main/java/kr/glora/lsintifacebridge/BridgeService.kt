@@ -31,6 +31,7 @@ class BridgeService : Service() {
         const val ACTION_STOP = "kr.glora.lsintifacebridge.ACTION_STOP"
         const val ACTION_STATUS = "kr.glora.lsintifacebridge.ACTION_STATUS"
         const val ACTION_TEST_LEVEL = "kr.glora.lsintifacebridge.ACTION_TEST_LEVEL"
+        const val ACTION_TOGGLE_SUCTION = "kr.glora.lsintifacebridge.ACTION_TOGGLE_SUCTION"
 
         const val EXTRA_WS_URL = "extra_ws_url"
         const val EXTRA_WS_STATUS = "extra_ws_status"
@@ -48,8 +49,6 @@ class BridgeService : Service() {
             0x97.toByte(), 0xFE.toByte(), 0x42.toByte(), 0x7C.toByte()
         )
 
-        private val CMD_ALL_STOP = byteArrayOf(0xE5.toByte(), 0x15.toByte(), 0x7D.toByte())
-
         // CANAL 1: VIBRACIÓN
         private val CMD_CH1_STOP = byteArrayOf(0xD5.toByte(), 0x96.toByte(), 0x4C.toByte())
         private val CMD_CH1_L1   = byteArrayOf(0xD4.toByte(), 0x1F.toByte(), 0x5D.toByte())
@@ -61,29 +60,6 @@ class BridgeService : Service() {
         private val CMD_CH2_L1   = byteArrayOf(0xA4.toByte(), 0x98.toByte(), 0x2E.toByte())
         private val CMD_CH2_L2   = byteArrayOf(0xA7.toByte(), 0x03.toByte(), 0x1C.toByte())
         private val CMD_CH2_L3   = byteArrayOf(0xA6.toByte(), 0x8A.toByte(), 0x0D.toByte())
-
-        // ============ UMBRALES DE PEAK ============
-        private const val SUCTION_MIN_PEAK = 5
-        private const val SUCTION_L2_PEAK  = 10
-        private const val SUCTION_L3_PEAK  = 15
-
-        // ============ DURACIONES POR NIVEL (ms) ============
-        private const val SUCK_L1_MS = 1200L
-        private const val SUCK_L2_MS = 2000L
-        private const val SUCK_L3_MS = 3000L
-
-        private const val VENT_L1_MS = 600L
-        private const val VENT_L2_MS = 800L
-        private const val VENT_L3_MS = 1000L
-
-        // ============ PEAK-HOLD ============
-        // Cuando un ciclo termina, en vez de mirar el peak "instantáneo"
-        // (que puede estar en un valle), usamos el máximo visto en esta ventana.
-        private const val PEAK_HOLD_MS = 500L
-
-        // Pequeña pausa entre ciclos para evitar arranques consecutivos
-        // por un peak que ya estaba decayendo.
-        private const val CYCLE_COOLDOWN_MS = 100L
     }
 
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -93,30 +69,53 @@ class BridgeService : Service() {
     private var currentWsStatus: String = "Disconnected"
     private var currentBleStatus: String = "Ready"
 
+    // ---- Vibración (tu versión preferida, intacta) ----
     private var currentVibrationLevel = 0
-    private var currentRotationLevel = 0
+    private var currentFunscriptInput = 0
+    private var lastSentCmd: ByteArray? = null
 
-    // ---- Estado del ciclo de succión LATCHEADO ----
-    private var cycleActive = false
-    private var latchedLevel = 0
-    private var isVenting = false
-    private var lastCycleSwitchTime = 0L
-    private var cycleJustEndedTime = 0L
+    private var lastPacketReceivedTime = 0L
+    private val VIDEO_PAUSE_TIMEOUT_MS = 1200L
 
-    // ---- Peak-Hold ----
-    private var peakHoldValue = 0
-    private var peakHoldTime = 0L
+    private var isSuctionEnabled = true
 
+    // ---- Succión: máquina de estados ----
+    // 0 = IDLE, 1 = SUCCIONANDO, 2 = VENTILANDO
+    private var suctionState = 0
+    private var suctionTimerStart = 0L
+    private var suctionLevel = 0          // 1, 2, 3 mientras succiona; 0 en reposo
+    private var suctionPulseMs = 1200L    // duración del pulso actual, según nivel
+
+    private val VENT_COOLDOWN_DURATION_MS = 600L
+
+    // Duraciones por nivel (a mayor pico → más tiempo de vacío)
+    private fun pulseMsForLevel(level: Int): Long = when (level) {
+        3 -> 2400L
+        2 -> 1600L
+        else -> 1200L
+    }
+
+    // Nivel según el peak del funscript
+    private fun levelFromPeak(peak: Int): Int = when {
+        peak >= 15 -> 3
+        peak >= 10 -> 2
+        peak >= 5  -> 1
+        else       -> 0
+    }
+
+    // ---- Emisión RF (misma cadencia que la versión que funcionaba) ----
+    private var lastRfCycleTime = 0L
+    private val RF_CYCLE_INTERVAL_MS = 50L
     private var channelToggle = false
 
     private val okHttpClient = OkHttpClient.Builder()
         .pingInterval(10, TimeUnit.SECONDS)
         .build()
 
-    private val broadcastRunnable = object : Runnable {
+    private val loopRunnable = object : Runnable {
         override fun run() {
-            sendHardwareCycle()
-            handler.postDelayed(this, 50)
+            manageHardware()
+            handler.postDelayed(this, 50)  // Loop a 50 ms, igual que la versión que funcionaba
         }
     }
 
@@ -144,24 +143,31 @@ class BridgeService : Service() {
                 val url = intent.getStringExtra(EXTRA_WS_URL) ?: return START_NOT_STICKY
                 startForegroundNotification()
                 connectWebSocket(url)
-                handler.removeCallbacks(broadcastRunnable)
-                handler.post(broadcastRunnable)
-                sendStatusUpdate(log = "Iniciando servicio (latch activo)...")
+                handler.removeCallbacks(loopRunnable)
+                handler.post(loopRunnable)
+                transmitBle(CMD_CH1_STOP, force = true)
+                transmitBle(CMD_CH2_STOP, force = true)
+                sendStatusUpdate(log = "Puente listo (Vib por picos + Succión latch)")
             }
             ACTION_STOP -> {
                 stopBridge()
                 stopSelf()
             }
+            ACTION_TOGGLE_SUCTION -> {
+                isSuctionEnabled = !isSuctionEnabled
+                if (!isSuctionEnabled) {
+                    suctionState = 0
+                    suctionLevel = 0
+                    transmitBle(CMD_CH2_STOP, force = true)
+                }
+                startForegroundNotification()
+                sendStatusUpdate(log = if (isSuctionEnabled) "Succión: ON" else "Succión: OFF")
+            }
             ACTION_TEST_LEVEL -> {
                 if (intent.hasExtra(EXTRA_VIBRATION_LEVEL)) {
-                    currentVibrationLevel = intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0).coerceIn(0, 20)
+                    val lvl = intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0).coerceIn(0, 20)
+                    processInput(lvl)
                 }
-                if (intent.hasExtra(EXTRA_ROTATION_LEVEL)) {
-                    val v = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0).coerceIn(0, 20)
-                    currentRotationLevel = v
-                    recordPeak(v, System.currentTimeMillis())
-                }
-                sendStatusUpdate(log = "Manual: Vibe=$currentVibrationLevel, Suct=$currentRotationLevel")
             }
         }
         return START_STICKY
@@ -181,10 +187,17 @@ class BridgeService : Service() {
             this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val toggleIntent = Intent(this, BridgeService::class.java).apply { action = ACTION_TOGGLE_SUCTION }
+        val togglePending = PendingIntent.getService(
+            this, 1, toggleIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val suctionBtnLabel = if (isSuctionEnabled) "Succión: ON" else "Succión: OFF"
+
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText("Bridge activo (succión latch)")
+            .setContentText(if (isSuctionEnabled) "Vib por picos + Succión latch" else "Solo Vibración")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .addAction(Notification.Action.Builder(null, suctionBtnLabel, togglePending).build())
             .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
             .setOngoing(true)
             .build()
@@ -208,7 +221,7 @@ class BridgeService : Service() {
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 currentWsStatus = "Connected"
-                sendStatusUpdate(log = "Conectado. Enviando Handshake...")
+                sendStatusUpdate(log = "Conectado. Handshake OK")
                 ws.send("{\"identifier\": \"LVSDevice\", \"address\": \"001122334455\", \"version\": 0}")
             }
 
@@ -246,161 +259,156 @@ class BridgeService : Service() {
             when {
                 cmd.equals("DeviceType", ignoreCase = true) -> {
                     sendLovenseResponse("P:11:001122334455;\r\n")
-                    sendStatusUpdate(log = "Handshake OK: Identificado P:11")
                 }
                 cmd.equals("Battery", ignoreCase = true) -> {
                     sendLovenseResponse("90;\r\n")
                 }
-                cmd.startsWith("Vibrate:", ignoreCase = true) -> {
-                    val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
-                    currentVibrationLevel = value
-                    currentRotationLevel = value   // Modo dual
-                    recordPeak(value, System.currentTimeMillis())
-                    sendStatusUpdate(log = "RX: Vibrate:$value")
-                }
+                cmd.startsWith("Vibrate:", ignoreCase = true) ||
                 cmd.startsWith("Vibrate1:", ignoreCase = true) -> {
-                    val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
-                    currentVibrationLevel = value
-                    sendStatusUpdate(log = "RX: Vibrate1:$value")
-                }
-                cmd.startsWith("Vibrate2:", ignoreCase = true) || cmd.startsWith("Rotate:", ignoreCase = true) -> {
-                    val value = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
-                    currentRotationLevel = value
-                    recordPeak(value, System.currentTimeMillis())
-                    sendStatusUpdate(log = "RX: Suct/Rot:$value")
+                    val rawValue = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
+                    processInput(rawValue)
                 }
                 cmd.equals("Stop", ignoreCase = true) -> {
                     currentVibrationLevel = 0
-                    currentRotationLevel = 0
-                    cycleActive = false
-                    latchedLevel = 0
-                    isVenting = false
-                    peakHoldValue = 0
-                    sendStatusUpdate(log = "RX: Stop")
+                    currentFunscriptInput = 0
+                    suctionState = 0
+                    suctionLevel = 0
+                    transmitBle(CMD_CH1_STOP, force = true)
+                    transmitBle(CMD_CH2_STOP, force = true)
+                    sendStatusUpdate(log = "Stop")
                 }
             }
         }
     }
 
-    /**
-     * Registra el peak para el "peak-hold".
-     * Solo actualiza el valor de referencia si:
-     *  - el nuevo valor es mayor o igual al actual, o
-     *  - ha pasado suficiente tiempo desde la última actualización
-     *    (para que la ventana se deslice hacia abajo sola).
-     */
-    private fun recordPeak(value: Int, now: Long) {
-        val expired = (now - peakHoldTime) > PEAK_HOLD_MS
-        if (expired || value >= peakHoldValue) {
-            peakHoldValue = value
-            peakHoldTime = now
+    private fun processInput(rawValue: Int) {
+        val now = System.currentTimeMillis()
+        lastPacketReceivedTime = now
+        currentFunscriptInput = rawValue
+
+        // ========== 1. VIBRACIÓN (tu lógica preferida, intacta) ==========
+        val newVibeLevel = when {
+            rawValue >= 10   -> 3
+            rawValue in 5..9 -> 2
+            else             -> 0
+        }
+
+        if (newVibeLevel != currentVibrationLevel) {
+            currentVibrationLevel = newVibeLevel
+            applyVibrationHardware(force = true)
+            sendStatusUpdate(log = if (newVibeLevel > 0) "Vib: Nivel $newVibeLevel" else "Vib: 0")
+        }
+
+        // ========== 2. SUCCIÓN ==========
+        if (!isSuctionEnabled) return
+
+        // Solo arrancamos un ciclo NUEVO si estamos en IDLE y hay peak suficiente.
+        // El ciclo en curso NUNCA se interrumpe aunque lleguen peaks a 0.
+        if (suctionState == 0) {
+            val lvl = levelFromPeak(rawValue)
+            if (lvl > 0) {
+                startSuctionPulse(now, lvl)
+            }
         }
     }
 
-    /**
-     * Devuelve el nivel de succión efectivo, usando el peak-hold.
-     * Si el peak-hold expiró (silencio prolongado), equivale al valor actual.
-     */
-    private fun effectivePeak(now: Long): Int {
-        return if (now - peakHoldTime > PEAK_HOLD_MS) 0 else peakHoldValue
+    private fun startSuctionPulse(now: Long, level: Int) {
+        suctionState = 1
+        suctionTimerStart = now
+        suctionLevel = level
+        suctionPulseMs = pulseMsForLevel(level)
+        applySuctionHardware(force = true)
+        sendStatusUpdate(log = "Suct: Nivel $level durante ${suctionPulseMs}ms")
     }
 
-    private fun levelFromPeak(peak: Int): Int = when {
-        peak >= SUCTION_L3_PEAK -> 3
-        peak >= SUCTION_L2_PEAK -> 2
-        peak >= SUCTION_MIN_PEAK -> 1
-        else -> 0
-    }
-
-    private fun suckDurationFor(level: Int): Long = when (level) {
-        3 -> SUCK_L3_MS
-        2 -> SUCK_L2_MS
-        else -> SUCK_L1_MS
-    }
-
-    private fun ventDurationFor(level: Int): Long = when (level) {
-        3 -> VENT_L3_MS
-        2 -> VENT_L2_MS
-        else -> VENT_L1_MS
-    }
-
-    private fun suctionCmdFor(level: Int): ByteArray = when (level) {
-        3 -> CMD_CH2_L3
-        2 -> CMD_CH2_L2
-        else -> CMD_CH2_L1
-    }
-
-    private fun sendHardwareCycle() {
+    private fun manageHardware() {
         val now = System.currentTimeMillis()
 
-        // ---- Canal 1: Vibración (sin cambios) ----
-        val ch1Cmd = when {
-            currentVibrationLevel == 0 -> CMD_CH1_STOP
-            currentVibrationLevel in 1..6 -> CMD_CH1_L1
-            currentVibrationLevel in 7..13 -> CMD_CH1_L2
-            else -> CMD_CH1_L3
-        }
-
-        // ---- Canal 2: Succión con latch ----
-        val ch2Cmd: ByteArray = if (!cycleActive) {
-            // Sin ciclo activo → ¿arrancamos uno?
-            val coolingDown = (now - cycleJustEndedTime) < CYCLE_COOLDOWN_MS
-            val peak = effectivePeak(now)
-            val level = levelFromPeak(peak)
-
-            if (coolingDown || level == 0) {
-                CMD_CH2_STOP
-            } else {
-                // Arranca ciclo latcheando el nivel actual
-                cycleActive = true
-                latchedLevel = level
-                isVenting = false
-                lastCycleSwitchTime = now
-                suctionCmdFor(level)
-            }
-        } else {
-            // Ciclo activo: ignoramos todos los peaks hasta terminarlo
-            val suckMs = suckDurationFor(latchedLevel)
-            val ventMs = ventDurationFor(latchedLevel)
-
-            if (isVenting) {
-                if (now - lastCycleSwitchTime >= ventMs) {
-                    // Ciclo completo → cerramos y dejamos que la próxima iteración decida
-                    cycleActive = false
-                    latchedLevel = 0
-                    isVenting = false
-                    cycleJustEndedTime = now
-                    CMD_CH2_STOP
-                } else {
-                    CMD_CH2_STOP
-                }
-            } else {
-                if (now - lastCycleSwitchTime >= suckMs) {
-                    // SUCK completado → pasamos a VENT
-                    isVenting = true
-                    lastCycleSwitchTime = now
-                    CMD_CH2_STOP
-                } else {
-                    suctionCmdFor(latchedLevel)
-                }
-            }
-        }
-
-        if (currentVibrationLevel == 0 && currentRotationLevel == 0 && !cycleActive) {
-            transmitBle(CMD_ALL_STOP)
+        // 1. Parada total si el vídeo se pausó
+        if ((currentVibrationLevel > 0 || suctionLevel > 0) &&
+            (now - lastPacketReceivedTime > VIDEO_PAUSE_TIMEOUT_MS)) {
+            currentVibrationLevel = 0
+            suctionLevel = 0
+            suctionState = 0
+            currentFunscriptInput = 0
+            transmitBle(CMD_CH1_STOP, force = true)
+            transmitBle(CMD_CH2_STOP, force = true)
+            sendStatusUpdate(log = "Vídeo pausado -> Motores detenidos")
             return
         }
 
-        channelToggle = !channelToggle
-        if (channelToggle) {
-            transmitBle(ch1Cmd)
-        } else {
-            transmitBle(ch2Cmd)
+        // 2. Máquina de estados de la succión
+        when (suctionState) {
+            1 -> { // SUCCIONANDO
+                if (now - suctionTimerStart >= suctionPulseMs) {
+                    suctionState = 2 // pasa a VENT
+                    suctionTimerStart = now
+                    suctionLevel = 0
+                    sendStatusUpdate(log = "Suct: Venteando ${VENT_COOLDOWN_DURATION_MS}ms")
+                }
+            }
+            2 -> { // VENTILANDO
+                if (now - suctionTimerStart >= VENT_COOLDOWN_DURATION_MS) {
+                    suctionState = 0 // IDLE
+                    // Re-evaluamos el peak ACTUAL (no latch): si sigue habiendo pico,
+                    // arrancamos otro ciclo; si no, nos quedamos en IDLE.
+                    val lvl = levelFromPeak(currentFunscriptInput)
+                    if (lvl > 0) {
+                        startSuctionPulse(now, lvl)
+                    }
+                }
+            }
+        }
+
+        // 3. Emisión RF: alterna CH1 / CH2 SIEMPRE que haya actividad de succión.
+        //    Durante VENT mandamos CH2_STOP repetidamente para que el watchdog no corte el motor.
+        if (now - lastRfCycleTime >= RF_CYCLE_INTERVAL_MS) {
+            lastRfCycleTime = now
+
+            if (suctionState != 0) {
+                channelToggle = !channelToggle
+                if (channelToggle) {
+                    applyVibrationHardware()
+                } else {
+                    if (suctionState == 1) {
+                        applySuctionHardware()
+                    } else {
+                        transmitBle(CMD_CH2_STOP)
+                    }
+                }
+            } else {
+                applyVibrationHardware()
+            }
         }
     }
 
-    private fun transmitBle(suffix: ByteArray) {
+    private fun applyVibrationHardware(force: Boolean = false) {
+        val cmd = when (currentVibrationLevel) {
+            2 -> CMD_CH1_L2
+            3 -> CMD_CH1_L3
+            else -> CMD_CH1_STOP
+        }
+        transmitBle(cmd, force)
+    }
+
+    private fun applySuctionHardware(force: Boolean = false) {
+        val cmd = when (suctionLevel) {
+            3 -> CMD_CH2_L3
+            2 -> CMD_CH2_L2
+            1 -> CMD_CH2_L1
+            else -> CMD_CH2_STOP
+        }
+        transmitBle(cmd, force)
+    }
+
+    private fun transmitBle(suffix: ByteArray, force: Boolean = false) {
         val adv = advertiser ?: return
+
+        if (!force && lastSentCmd != null && lastSentCmd!!.contentEquals(suffix)) {
+            return
+        }
+        lastSentCmd = suffix.clone()
+
         val payload = ByteArray(11)
         System.arraycopy(PREFIX, 0, payload, 0, 8)
         System.arraycopy(suffix, 0, payload, 8, 3)
@@ -428,7 +436,7 @@ class BridgeService : Service() {
             putExtra(EXTRA_BLE_STATUS, currentBleStatus)
             putExtra(EXTRA_LEVEL, currentVibrationLevel)
             putExtra(EXTRA_VIBRATION_LEVEL, currentVibrationLevel)
-            putExtra(EXTRA_ROTATION_LEVEL, latchedLevel)
+            putExtra(EXTRA_ROTATION_LEVEL, if (suctionState == 1) suctionLevel else 0)
             putExtra(EXTRA_LOG, log ?: "")
             setPackage(packageName)
         }
@@ -443,9 +451,10 @@ class BridgeService : Service() {
     }
 
     private fun stopBridge() {
-        handler.removeCallbacks(broadcastRunnable)
+        handler.removeCallbacks(loopRunnable)
         disconnectWebSocket()
-        transmitBle(CMD_ALL_STOP)
+        transmitBle(CMD_CH1_STOP, force = true)
+        transmitBle(CMD_CH2_STOP, force = true)
         try {
             advertiser?.stopAdvertising(bleCallback)
         } catch (ignored: Exception) {}
