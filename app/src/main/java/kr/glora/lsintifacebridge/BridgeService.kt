@@ -62,31 +62,25 @@ class BridgeService : Service() {
         private val CMD_CH2_L3   = byteArrayOf(0xA6.toByte(), 0x8A.toByte(), 0x0D.toByte())
 
         // ================= PARÁMETROS DE SUCCIÓN =================
-
-        // Nivel mínimo de peak para arrancar succión
         private const val SUCTION_MIN_PEAK = 5
 
-        // Duración base del pulso de succión según nivel (ms)
         private fun baseSuckMs(level: Int): Long = when (level) {
             3 -> 2000L
             2 -> 1500L
             else -> 1200L
         }
 
-        // Tope máximo de extensión dinámica (nunca succionar más de esto seguido)
         private const val SUCK_MAX_MS = 6000L
-
-        // Duración del venteo entre pulsos (ms)
         private const val VENT_MS = 700L
-
-        // Cada cuántos ms reevaluamos si extender el SUCK (mientras el peak siga alto)
         private const val SUCK_EXTEND_STEP_MS = 300L
 
-        // Cadencia del ciclo RF (ms). Cada ciclo se manda 1 paquete.
-        private const val RF_CYCLE_INTERVAL_MS = 45L
+        // ================= CADENCIAS INDEPENDIENTES =================
+        // Objetivo de cadencia por canal (ms). Menor = más paquetes.
+        private const val CH1_TARGET_MS = 70L   // Vibración (imperceptible)
+        private const val CH2_TARGET_MS = 40L   // Succión (más paquetes para la bomba)
 
-        // Prioridad CH2:CH1 durante succión. Cada 4 ciclos, 3 son CH2 y 1 es CH1.
-        private const val RF_CH2_RATIO = 3
+        // Tick del loop de scheduling
+        private const val TICK_MS = 15L
     }
 
     private var advertiser: BluetoothLeAdvertiser? = null
@@ -106,18 +100,17 @@ class BridgeService : Service() {
 
     private var isSuctionEnabled = true
 
-    // Succión: máquina de estados
-    // 0 = IDLE, 1 = SUCCIONANDO, 2 = VENTILANDO
+    // Succión: máquina de estados (0 = IDLE, 1 = SUCK, 2 = VENT)
     private var suctionState = 0
     private var suctionTimerStart = 0L
     private var suctionLevel = 0
     private var suctionSuckMs = 1200L
-    private var suctionExtendAccum = 0L   // cuánto llevamos extendido
+    private var suctionExtendAccum = 0L
     private var lastExtendCheckTime = 0L
 
-    // Emisión RF
-    private var lastRfCycleTime = 0L
-    private var rfCycleCounter = 0
+    // Scheduler independiente
+    private var lastCh1Tx = 0L
+    private var lastCh2Tx = 0L
 
     private val okHttpClient = OkHttpClient.Builder()
         .pingInterval(10, TimeUnit.SECONDS)
@@ -126,7 +119,7 @@ class BridgeService : Service() {
     private val loopRunnable = object : Runnable {
         override fun run() {
             manageHardware()
-            handler.postDelayed(this, 40)
+            handler.postDelayed(this, TICK_MS)
         }
     }
 
@@ -158,7 +151,7 @@ class BridgeService : Service() {
                 handler.post(loopRunnable)
                 transmitBle(CMD_CH1_STOP, force = true)
                 transmitBle(CMD_CH2_STOP, force = true)
-                sendStatusUpdate(log = "Puente listo (extensión dinámica de succión)")
+                sendStatusUpdate(log = "Puente listo (CH1=${CH1_TARGET_MS}ms / CH2=${CH2_TARGET_MS}ms)")
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -206,7 +199,7 @@ class BridgeService : Service() {
 
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText(if (isSuctionEnabled) "Vib por picos + Succión extendida" else "Solo Vibración")
+            .setContentText(if (isSuctionEnabled) "CH1=${CH1_TARGET_MS}ms / CH2=${CH2_TARGET_MS}ms" else "Solo Vibración")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .addAction(Notification.Action.Builder(null, suctionBtnLabel, togglePending).build())
             .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
@@ -313,8 +306,6 @@ class BridgeService : Service() {
         // ===== SUCCIÓN =====
         if (!isSuctionEnabled) return
 
-        // Solo arrancamos si estamos en IDLE. Los ciclos en curso NUNCA se abortan;
-        // se EXTIENDEN desde manageHardware() si el peak se mantiene.
         if (suctionState == 0) {
             val lvl = levelFromPeak(rawValue)
             if (lvl > 0) {
@@ -324,19 +315,19 @@ class BridgeService : Service() {
     }
 
     private fun levelFromPeak(peak: Int): Int = when {
-        peak >= SUCTION_MIN_PEAK -> 1   // Nivel único: L1. Los "niveles" ahora son de DURACIÓN.
+        peak >= SUCTION_MIN_PEAK -> 1
         else -> 0
     }
 
     private fun startSuctionPulse(now: Long, level: Int) {
         suctionState = 1
         suctionTimerStart = now
-        suctionLevel = 1               // Siempre usamos el comando L1 (el único que sabemos 100% que arranca la bomba)
+        suctionLevel = 1
         suctionSuckMs = baseSuckMs(level)
         suctionExtendAccum = 0L
         lastExtendCheckTime = now
         applySuctionHardware(force = true)
-        sendStatusUpdate(log = "Suct: inicio ${suctionSuckMs}ms (peak=$currentFunscriptInput)")
+        sendStatusUpdate(log = "Suct: inicio ${suctionSuckMs}ms")
     }
 
     private fun manageHardware() {
@@ -355,12 +346,9 @@ class BridgeService : Service() {
             return
         }
 
-        // 2. Máquina de estados
+        // 2. Máquina de estados de la succión
         when (suctionState) {
-            1 -> { // SUCCIONANDO
-                // Extensión dinámica: cada SUCK_EXTEND_STEP_MS, si el peak sigue >= 5,
-                // alargamos el ciclo. Esto hace que si el funscript mantiene un pico
-                // durante 3 segundos, la bomba no pare en medio.
+            1 -> { // SUCK
                 if (now - lastExtendCheckTime >= SUCK_EXTEND_STEP_MS) {
                     lastExtendCheckTime = now
                     if (currentFunscriptInput >= SUCTION_MIN_PEAK &&
@@ -378,40 +366,38 @@ class BridgeService : Service() {
                     sendStatusUpdate(log = "Suct: venteo ${VENT_MS}ms")
                 }
             }
-            2 -> { // VENTILANDO
-                // Si el peak vuelve a subir durante el venteo, cortamos el venteo
-                // y rearrancamos succión de inmediato.
+            2 -> { // VENT
                 if (currentFunscriptInput >= SUCTION_MIN_PEAK && now - suctionTimerStart >= 150L) {
-                    val lvl = levelFromPeak(currentFunscriptInput)
-                    startSuctionPulse(now, lvl)
+                    startSuctionPulse(now, levelFromPeak(currentFunscriptInput))
                 } else if (now - suctionTimerStart >= VENT_MS) {
                     suctionState = 0
                 }
             }
         }
 
-        // 3. Emisión RF con prioridad CH2 durante succión
-        if (now - lastRfCycleTime >= RF_CYCLE_INTERVAL_MS) {
-            lastRfCycleTime = now
-            rfCycleCounter = (rfCycleCounter + 1) % (RF_CH2_RATIO + 1)
+        // 3. Scheduler con cadencias independientes
+        val ch1Overdue = now - lastCh1Tx
+        val ch2Overdue = now - lastCh2Tx
 
-            val suctionActive = (suctionState != 0)
+        val wantCh1 = ch1Overdue >= CH1_TARGET_MS
+        val wantCh2 = (suctionState != 0) && ch2Overdue >= CH2_TARGET_MS
 
-            if (suctionActive) {
-                // 3 de cada 4 ciclos van a CH2, 1 de cada 4 a CH1
-                if (rfCycleCounter < RF_CH2_RATIO) {
-                    if (suctionState == 1) {
-                        applySuctionHardware()
-                    } else {
-                        transmitBle(CMD_CH2_STOP)
-                    }
-                } else {
-                    applyVibrationHardware()
-                }
+        if (wantCh2 && wantCh1) {
+            // Ambos vencidos: comparamos cuánto de "vencidos" están en proporción
+            // a su cadencia objetivo. El más retrasado proporcionalmente va primero.
+            if (ch2Overdue * CH1_TARGET_MS >= ch1Overdue * CH2_TARGET_MS) {
+                if (suctionState == 1) applySuctionHardware() else transmitBle(CMD_CH2_STOP)
+                lastCh2Tx = now
             } else {
-                // Sin succión activa, todo el ancho de banda para vibración
                 applyVibrationHardware()
+                lastCh1Tx = now
             }
+        } else if (wantCh2) {
+            if (suctionState == 1) applySuctionHardware() else transmitBle(CMD_CH2_STOP)
+            lastCh2Tx = now
+        } else if (wantCh1) {
+            applyVibrationHardware()
+            lastCh1Tx = now
         }
     }
 
@@ -425,8 +411,6 @@ class BridgeService : Service() {
     }
 
     private fun applySuctionHardware(force: Boolean = false) {
-        // Solo usamos L1 porque es el único comando de succión 100% verificado.
-        // Los niveles ahora se diferencian por DURACIÓN, no por byte de comando.
         val cmd = if (suctionLevel > 0) CMD_CH2_L1 else CMD_CH2_STOP
         transmitBle(cmd, force)
     }
