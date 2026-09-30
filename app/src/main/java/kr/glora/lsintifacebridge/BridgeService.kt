@@ -62,7 +62,7 @@ class BridgeService : Service() {
         private val CMD_CH2_L3   = byteArrayOf(0xA6.toByte(), 0x8A.toByte(), 0x0D.toByte())
 
         // ================= PARÁMETROS DE SUCCIÓN =================
-        private const val SUCTION_MIN_PEAK = 5
+        private const val SUCTION_MIN_PEAK = 8
 
         private fun baseSuckMs(level: Int): Long = when (level) {
             3 -> 2000L
