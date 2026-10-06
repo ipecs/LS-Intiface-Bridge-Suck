@@ -27,6 +27,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -47,7 +48,14 @@ class MainActivity : ComponentActivity() {
     private var vibeLovenseLevel by mutableIntStateOf(0)
     private var rotateLovenseLevel by mutableIntStateOf(0)
     private var testVibeLevel by mutableIntStateOf(10)
-    private var testRotateLevel by mutableIntStateOf(10)
+    private var testRotateLevel by mutableIntStateOf(1)
+    private var suctionEnabled by mutableStateOf(false)
+    private var bridgeRunning by mutableStateOf(false)
+    private var phase by mutableStateOf("IDLE")
+    private var followsVibration by mutableStateOf(true)
+    private var threeLevels by mutableStateOf(false)
+    private var pulseSeconds by mutableStateOf(0.7f)
+    private var cooldownSeconds by mutableStateOf(1.0f)
     private var logText by mutableStateOf("")
 
     private val permissions: Array<String>
@@ -76,13 +84,20 @@ class MainActivity : ComponentActivity() {
             currentLevel = intent.getIntExtra(BridgeService.EXTRA_LEVEL, currentLevel)
             vibeLovenseLevel = intent.getIntExtra(BridgeService.EXTRA_VIBRATION_LEVEL, vibeLovenseLevel)
             rotateLovenseLevel = intent.getIntExtra(BridgeService.EXTRA_ROTATION_LEVEL, rotateLovenseLevel)
-            intent.getStringExtra(BridgeService.EXTRA_LOG)?.let(::appendLog)
+            suctionEnabled = intent.getBooleanExtra(BridgeService.EXTRA_SUCTION_ENABLED, false)
+            bridgeRunning = intent.getBooleanExtra(BridgeService.EXTRA_RUNNING, false)
+            phase = intent.getStringExtra(BridgeService.EXTRA_PHASE) ?: phase
+            intent.getStringExtra(BridgeService.EXTRA_LOG)?.takeIf { it.isNotBlank() }?.let(::appendLog)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         wsUrl = preferences().getString(PREF_WS_URL, DEFAULT_WS_URL) ?: DEFAULT_WS_URL
+        followsVibration = preferences().getBoolean("follow_vibration", true)
+        threeLevels = preferences().getBoolean("three_levels", false)
+        pulseSeconds = preferences().getLong("pulse_ms", 700L) / 1000f
+        cooldownSeconds = preferences().getLong("cooldown_ms", 1000L) / 1000f
         requestMissingPermissions()
 
         setContent {
@@ -92,7 +107,8 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier
                             .padding(innerPadding)
                             .padding(16.dp)
-                            .fillMaxSize(),
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text("LS Intiface Bridge", style = MaterialTheme.typography.titleLarge)
@@ -116,6 +132,36 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Switch(checked = suctionEnabled, enabled = bridgeRunning,
+                                onCheckedChange = { enabled ->
+                                    startService(Intent(this@MainActivity, BridgeService::class.java)
+                                        .setAction(BridgeService.ACTION_TOGGLE_SUCTION)
+                                        .putExtra(BridgeService.EXTRA_SUCTION_ENABLED, enabled))
+                                })
+                            Text("Habilitar succión")
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Switch(checked = followsVibration, onCheckedChange = {
+                                followsVibration = it; saveConfig()
+                            })
+                            Text("Succión desde los picos de vibración")
+                        }
+                        Text(if (followsVibration) "Un solo script: pulso por pico nuevo."
+                            else "Dos controles: Vibrate y Rotate independientes.")
+                        Text("Duración máxima del pulso: %.1f s".format(pulseSeconds))
+                        Slider(value = pulseSeconds, onValueChange = { pulseSeconds = it },
+                            onValueChangeFinished = { saveConfig() }, valueRange = 0.7f..5f, steps = 42)
+                        Text("Descanso con orden de parada: %.1f s".format(cooldownSeconds))
+                        Slider(value = cooldownSeconds, onValueChange = { cooldownSeconds = it },
+                            onValueChangeFinished = { saveConfig() }, valueRange = 0.7f..5f, steps = 42)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Switch(checked = threeLevels, onCheckedChange = { threeLevels = it; saveConfig() })
+                            Text("Tres niveles por script (experimental)")
+                        }
+                        Text("Probar primero sin contacto corporal. La parada de la bomba no confirma liberación del vacío.",
+                            style = MaterialTheme.typography.bodySmall)
+
                         // Vibration Test Control
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             Text("Test Vibration: $testVibeLevel (0..20)")
@@ -129,12 +175,12 @@ class MainActivity : ComponentActivity() {
 
                         // Rotation Test Control
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text("Test Rotation: $testRotateLevel (0..20)")
+                            Text("Prueba de succión: comando $testRotateLevel (1..3)")
                             Slider(
                                 value = testRotateLevel.toFloat(),
                                 onValueChange = { testRotateLevel = it.roundToInt() },
-                                valueRange = 0f..20f,
-                                steps = 19,
+                                valueRange = 1f..3f,
+                                steps = 1,
                             )
                         }
 
@@ -147,10 +193,7 @@ class MainActivity : ComponentActivity() {
                                 Text("Vib")
                             }
                             Button(onClick = { testRotation(testRotateLevel) }) {
-                                Text("Rot")
-                            }
-                            Button(onClick = { testBoth(testVibeLevel, testRotateLevel) }) {
-                                Text("Both")
+                                Text("Succión")
                             }
                             Button(onClick = { stopAll() }) {
                                 Text("Off")
@@ -159,13 +202,13 @@ class MainActivity : ComponentActivity() {
 
                         Text("WebSocket: $webSocketStatus")
                         Text("BLE: $bleStatus")
-                        Text("State: Vib $vibeLovenseLevel / Rot $rotateLovenseLevel (Current L$currentLevel)")
+                        Text("Orden: Vib $vibeLovenseLevel / Succión $rotateLovenseLevel | $phase")
                         Spacer(Modifier.height(4.dp))
                         Text(
                             text = logText,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .weight(1f)
+                                .height(180.dp)
                                 .verticalScroll(rememberScrollState()),
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -183,6 +226,7 @@ class MainActivity : ComponentActivity() {
         } else {
             registerReceiver(statusReceiver, filter)
         }
+        startService(Intent(this, BridgeService::class.java).setAction(BridgeService.ACTION_GET_STATUS))
     }
 
     override fun onStop() {
@@ -234,10 +278,16 @@ class MainActivity : ComponentActivity() {
 
     private fun stopAll() {
         val intent = Intent(this, BridgeService::class.java)
-            .setAction(BridgeService.ACTION_TEST_LEVEL)
-            .putExtra(BridgeService.EXTRA_VIBRATION_LEVEL, 0)
-            .putExtra(BridgeService.EXTRA_ROTATION_LEVEL, 0)
-        ContextCompat.startForegroundService(this, intent)
+            .setAction(BridgeService.ACTION_OFF)
+        startService(intent)
+    }
+
+    private fun saveConfig() {
+        startService(Intent(this, BridgeService::class.java).setAction(BridgeService.ACTION_CONFIG)
+            .putExtra(BridgeService.EXTRA_PULSE_MS, (pulseSeconds * 1000).toLong())
+            .putExtra(BridgeService.EXTRA_COOLDOWN_MS, (cooldownSeconds * 1000).toLong())
+            .putExtra(BridgeService.EXTRA_FOLLOW_VIBRATION, followsVibration)
+            .putExtra(BridgeService.EXTRA_THREE_LEVELS, threeLevels))
     }
 
     private fun requestMissingPermissions() {
@@ -266,4 +316,3 @@ class MainActivity : ComponentActivity() {
         private const val PREF_WS_URL = "ws_url"
     }
 }
-

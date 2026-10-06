@@ -11,9 +11,9 @@ android {
     defaultConfig {
         applicationId = "kr.glora.lsintifacebridge"
         minSdk = 31
-        targetSdk = 33
-        versionCode = 1
-        versionName = "1.0"
+        targetSdk = 35
+        versionCode = 2
+        versionName = "1.1-test"
     }
 
     buildTypes {
@@ -48,5 +48,6 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.okhttp)
+    testImplementation(libs.junit)
     debugImplementation(libs.androidx.ui.tooling)
 }

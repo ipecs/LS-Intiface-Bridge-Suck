@@ -1,30 +1,305 @@
 package kr.glora.lsintifacebridge
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
+import android.Manifest
+import android.app.*
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
-import android.bluetooth.le.BluetoothLeAdvertiser
-import android.content.Context
 import android.content.Intent
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
+import android.content.pm.PackageManager
+import android.os.*
+import androidx.core.content.ContextCompat
+import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.encodeUtf8
 import java.util.concurrent.TimeUnit
 
 class BridgeService : Service() {
+    private val handler = Handler(Looper.getMainLooper())
+    private val controller = ActuationController()
+    private val client = OkHttpClient.Builder().pingInterval(10, TimeUnit.SECONDS).build()
+    private var radio: BleTransmitter? = null
+    private var socket: WebSocket? = null
+    private var session = 0
+    private var running = false
+    private var shuttingDown = false
+    private var shutdownStart = 0L
+    private var stopVibrationAppliedAt: Long? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wsStatus = "Disconnected"
+    private var bleStatus = "Idle"
+    private var followsVibration = true
+    private var lastSnapshot = ""
+    private val prefs by lazy { getSharedPreferences("bridge_settings", MODE_PRIVATE) }
+
+    private val loop = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val now = SystemClock.elapsedRealtime()
+            controller.tick(now)
+            val command = if (controller.phase == ActuationController.Phase.IDLE) {
+                BleTransmitter.VIBRATION[controller.vibrationLevel]
+            } else {
+                BleTransmitter.SUCTION[controller.suctionLevel]
+            }
+            radio?.request(command)
+            if (command == BleTransmitter.SUCTION[0] && radio?.confirmed == command) {
+                controller.stopDataApplied(now)
+            }
+            if (shuttingDown) {
+                val stoppedAt = stopVibrationAppliedAt
+                if (stoppedAt != null && now - stoppedAt >= 500L) {
+                    finishShutdown()
+                    return
+                }
+                if (now - shutdownStart > 8000L) {
+                    publish("Parada BLE no completada; comprobar y apagar el juguete físicamente")
+                    finishShutdown()
+                    return
+                }
+            }
+            publish()
+            handler.postDelayed(this, 25L)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        followsVibration = prefs.getBoolean("follow_vibration", true)
+        controller.configure(prefs.getLong("pulse_ms", 700L), prefs.getLong("cooldown_ms", 1000L), now())
+        controller.threeLevels = prefs.getBoolean("three_levels", false)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) { stopSelf(); return START_NOT_STICKY }
+        when (intent.action) {
+            ACTION_START -> {
+                if (shuttingDown) return START_NOT_STICKY
+                if (!ensureRunning()) return START_NOT_STICKY
+                controller.setSuctionEnabled(false)
+                controller.stopAll()
+                notification()
+                connect(intent.getStringExtra(EXTRA_WS_URL).orEmpty())
+            }
+            ACTION_STOP -> if (running) {
+                shuttingDown = true
+                shutdownStart = now()
+                stopVibrationAppliedAt = null
+                disconnect()
+                controller.stopAll()
+                publish("Parando ambos canales antes de cerrar la emisión")
+            } else stopSelf()
+            ACTION_OFF -> if (running) {
+                controller.stopAll()
+                publish("Parada solicitada")
+            } else stopSelf()
+            ACTION_TOGGLE_SUCTION -> {
+                if (running && !shuttingDown) {
+                    controller.setSuctionEnabled(intent.getBooleanExtra(EXTRA_SUCTION_ENABLED, !controller.suctionEnabled))
+                    notification()
+                    publish("Succión ${if (controller.suctionEnabled) "habilitada: esperando pico nuevo" else "deshabilitada"}")
+                } else if (!running) stopSelf()
+            }
+            ACTION_CONFIG -> {
+                controller.stopAll()
+                controller.configure(intent.getLongExtra(EXTRA_PULSE_MS, controller.pulseMs),
+                    intent.getLongExtra(EXTRA_COOLDOWN_MS, controller.cooldownMs), now())
+                followsVibration = intent.getBooleanExtra(EXTRA_FOLLOW_VIBRATION, followsVibration)
+                controller.threeLevels = intent.getBooleanExtra(EXTRA_THREE_LEVELS, controller.threeLevels)
+                prefs.edit().putLong("pulse_ms", controller.pulseMs).putLong("cooldown_ms", controller.cooldownMs)
+                    .putBoolean("follow_vibration", followsVibration).putBoolean("three_levels", controller.threeLevels).apply()
+                publish("Ajustes guardados; ciclo detenido")
+                if (!running) stopSelf()
+            }
+            ACTION_TEST_LEVEL -> {
+                if (!shuttingDown && ensureRunning()) {
+                    if (intent.hasExtra(EXTRA_VIBRATION_LEVEL)) {
+                        controller.vibration(intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0), now(), 2000L)
+                    }
+                    if (intent.hasExtra(EXTRA_ROTATION_LEVEL)) {
+                        val level = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0)
+                        if (level == 0) controller.stopAll()
+                        else if (!controller.manualPulse(level, now())) {
+                            publish("Prueba no iniciada: habilitar succión y esperar a que termine el descanso")
+                        }
+                    }
+                    publish("Prueba local: vibración limitada a 2 s; succión limitada al ajuste de pulso")
+                }
+            }
+            ACTION_GET_STATUS -> { publish(force = true); if (!running) stopSelf() }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun ensureRunning(): Boolean {
+        if (running && radio?.isClosed == false) return true
+        if (running) {
+            handler.removeCallbacks(loop)
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            radio = null
+            running = false
+        }
+        val permissions = listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
+        if (permissions.any { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }) {
+            publish("Faltan permisos Bluetooth"); stopSelf(); return false
+        }
+        val advertiser = try {
+            getSystemService(BluetoothManager::class.java)?.adapter?.bluetoothLeAdvertiser
+        } catch (e: SecurityException) { null }
+        if (advertiser == null) {
+            bleStatus = "Bluetooth apagado o sin soporte de emisión"
+            publish(bleStatus); stopSelf(); return false
+        }
+        notification()
+        wakeLock = getSystemService(PowerManager::class.java).newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK, "$packageName:Bridge").apply { acquire() }
+        radio = BleTransmitter(advertiser, handler, { command ->
+            val now = now()
+            controller.tick(now)
+            bleStatus = "Android aceptó %06X".format(command)
+            if (command == BleTransmitter.SUCTION[0]) controller.stopDataApplied(now)
+            if (shuttingDown && command == BleTransmitter.VIBRATION[0] &&
+                controller.phase == ActuationController.Phase.IDLE) stopVibrationAppliedAt = now
+            if (command in BleTransmitter.SUCTION.drop(1) &&
+                controller.phase != ActuationController.Phase.SUCKING) {
+                radio?.request(BleTransmitter.SUCTION[0])
+            }
+            publish(bleStatus)
+        }, { message ->
+            controller.setSuctionEnabled(false)
+            controller.stopAll()
+            bleStatus = "Error BLE"
+            notification()
+            publish(message)
+        })
+        controller.stopAll() // Flush the pump stop before accepting activation.
+        running = true
+        handler.post(loop)
+        return true
+    }
+
+    private fun connect(url: String) {
+        disconnect()
+        val request = try {
+            Request.Builder().url(url).build().also {
+                require(it.url.scheme in listOf("http", "https"))
+            }
+        } catch (e: Exception) { wsStatus = "URL inválida"; publish(wsStatus); return }
+        wsStatus = "Connecting"
+        val generation = session
+        val parser = LovenseProtocol(::handleCommand)
+        socket = client.newWebSocket(request, object : WebSocketListener() {
+            private fun onMain(ws: WebSocket, action: () -> Unit) {
+                handler.post { if (generation == session && socket === ws && !shuttingDown) action() }
+            }
+            override fun onOpen(ws: WebSocket, response: Response) = onMain(ws) {
+                wsStatus = "Connected"
+                ws.send("{\"identifier\":\"LVSDevice\",\"address\":\"001122334455\",\"version\":0}")
+                publish("Intiface conectado; perfil Nora para vibración y rotación")
+            }
+            override fun onMessage(ws: WebSocket, text: String) = onMain(ws) {
+                val reply = parser.receive(text)
+                if (reply.isNotEmpty()) ws.send(reply)
+            }
+            override fun onMessage(ws: WebSocket, bytes: ByteString) = onMain(ws) {
+                val reply = parser.receive(bytes.utf8())
+                if (reply.isNotEmpty()) ws.send(reply.encodeUtf8())
+            }
+            override fun onClosing(ws: WebSocket, code: Int, reason: String) = onMain(ws) {
+                controller.stopAll()
+                ws.close(code, reason)
+            }
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) = onMain(ws) {
+                wsStatus = "Disconnected"; controller.stopAll(); publish("WebSocket cerrado: $reason")
+            }
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) = onMain(ws) {
+                wsStatus = "Error"; controller.stopAll(); publish("Conexión perdida: ${t.message}")
+            }
+        })
+        publish("Conectando a Intiface")
+    }
+
+    private fun handleCommand(name: String, value: Int?): String = when (name) {
+        "devicetype" -> "C:11:001122334455;"
+        "battery" -> "ERR;" // This broadcast protocol exposes no battery telemetry.
+        "status" -> "2;"
+        "autoswitch", "rotatechange" -> "OK;"
+        "vibrate", "vibrate1" -> {
+            if (value == null || value !in 0..20) "ERR;" else {
+                controller.vibration(value, now())
+                if (followsVibration) controller.suctionInput(value, now(), stopOnZero = false)
+                "OK;"
+            }
+        }
+        "rotate", "vibrate2" -> {
+            if (value == null || value !in 0..20) "ERR;" else {
+                if (!followsVibration) controller.suctionInput(value, now())
+                "OK;"
+            }
+        }
+        "stop", "stopdevice", "poweroff" -> { controller.stopAll(); "OK;" }
+        else -> "ERR;"
+    }
+
+    private fun disconnect() {
+        session++
+        socket?.close(1000, "Bridge stopped")
+        socket = null
+        wsStatus = "Disconnected"
+    }
+
+    private fun finishShutdown() {
+        running = false
+        radio?.close()
+        radio = null
+        bleStatus = "Stopped"
+        publish("Emisión cerrada", force = true)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun notification() {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "LS Bridge", NotificationManager.IMPORTANCE_LOW))
+        fun action(name: String, code: Int, intentAction: String): Notification.Action {
+            val intent = Intent(this, BridgeService::class.java).setAction(intentAction)
+            val pending = PendingIntent.getService(this, code, intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            return Notification.Action.Builder(null, name, pending).build()
+        }
+        val notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("LS Intiface Bridge")
+            .setContentText(if (controller.suctionEnabled) "Succión habilitada" else "Solo vibración")
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentIntent(PendingIntent.getActivity(this, 3, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+            .addAction(action(if (controller.suctionEnabled) "Desactivar succión" else "Habilitar succión", 1, ACTION_TOGGLE_SUCTION))
+            .addAction(action("Parar", 0, ACTION_STOP)).setOngoing(true).build()
+        startForeground(NOTIFICATION_ID, notification)
+    }
+
+    private fun publish(log: String = "", force: Boolean = false) {
+        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.suctionLevel}|${controller.phase}|${controller.suctionEnabled}|$running"
+        if (!force && log.isEmpty() && snapshot == lastSnapshot) return
+        lastSnapshot = snapshot
+        sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName)
+            .putExtra(EXTRA_WS_STATUS, wsStatus).putExtra(EXTRA_BLE_STATUS, bleStatus)
+            .putExtra(EXTRA_LEVEL, controller.vibrationLevel)
+            .putExtra(EXTRA_VIBRATION_LEVEL, controller.vibrationInput)
+            .putExtra(EXTRA_ROTATION_LEVEL, controller.suctionLevel)
+            .putExtra(EXTRA_SUCTION_ENABLED, controller.suctionEnabled)
+            .putExtra(EXTRA_PHASE, controller.phase.name).putExtra(EXTRA_RUNNING, running)
+            .putExtra(EXTRA_LOG, log))
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
+        disconnect()
+        radio?.close()
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
+        super.onDestroy()
+    }
+    override fun onBind(intent: Intent?): IBinder? = null
+    private fun now() = SystemClock.elapsedRealtime()
 
     companion object {
         const val ACTION_START = "kr.glora.lsintifacebridge.ACTION_START"
@@ -32,7 +307,9 @@ class BridgeService : Service() {
         const val ACTION_STATUS = "kr.glora.lsintifacebridge.ACTION_STATUS"
         const val ACTION_TEST_LEVEL = "kr.glora.lsintifacebridge.ACTION_TEST_LEVEL"
         const val ACTION_TOGGLE_SUCTION = "kr.glora.lsintifacebridge.ACTION_TOGGLE_SUCTION"
-
+        const val ACTION_CONFIG = "kr.glora.lsintifacebridge.ACTION_CONFIG"
+        const val ACTION_OFF = "kr.glora.lsintifacebridge.ACTION_OFF"
+        const val ACTION_GET_STATUS = "kr.glora.lsintifacebridge.ACTION_GET_STATUS"
         const val EXTRA_WS_URL = "extra_ws_url"
         const val EXTRA_WS_STATUS = "extra_ws_status"
         const val EXTRA_BLE_STATUS = "extra_ble_status"
@@ -40,447 +317,14 @@ class BridgeService : Service() {
         const val EXTRA_VIBRATION_LEVEL = "extra_vibration_level"
         const val EXTRA_ROTATION_LEVEL = "extra_rotation_level"
         const val EXTRA_LOG = "extra_log"
-
+        const val EXTRA_SUCTION_ENABLED = "suction_enabled"
+        const val EXTRA_PULSE_MS = "pulse_ms"
+        const val EXTRA_COOLDOWN_MS = "cooldown_ms"
+        const val EXTRA_FOLLOW_VIBRATION = "follow_vibration"
+        const val EXTRA_THREE_LEVELS = "three_levels"
+        const val EXTRA_PHASE = "phase"
+        const val EXTRA_RUNNING = "running"
         private const val CHANNEL_ID = "ls_bridge_channel"
         private const val NOTIFICATION_ID = 1001
-
-        private val PREFIX = byteArrayOf(
-            0x6D.toByte(), 0xB6.toByte(), 0x43.toByte(), 0xCE.toByte(),
-            0x97.toByte(), 0xFE.toByte(), 0x42.toByte(), 0x7C.toByte()
-        )
-
-        // CANAL 1: VIBRACIÓN
-        private val CMD_CH1_STOP = byteArrayOf(0xD5.toByte(), 0x96.toByte(), 0x4C.toByte())
-        private val CMD_CH1_L1   = byteArrayOf(0xD4.toByte(), 0x1F.toByte(), 0x5D.toByte())
-        private val CMD_CH1_L2   = byteArrayOf(0xD7.toByte(), 0x84.toByte(), 0x6F.toByte())
-        private val CMD_CH1_L3   = byteArrayOf(0xD6.toByte(), 0x0D.toByte(), 0x7E.toByte())
-
-        // CANAL 2: SUCCIÓN
-        private val CMD_CH2_STOP = byteArrayOf(0xA5.toByte(), 0x11.toByte(), 0x3F.toByte())
-        private val CMD_CH2_L1   = byteArrayOf(0xA4.toByte(), 0x98.toByte(), 0x2E.toByte())
-        private val CMD_CH2_L2   = byteArrayOf(0xA7.toByte(), 0x03.toByte(), 0x1C.toByte())
-        private val CMD_CH2_L3   = byteArrayOf(0xA6.toByte(), 0x8A.toByte(), 0x0D.toByte())
-
-        // ================= PARÁMETROS DE SUCCIÓN =================
-        private const val SUCTION_MIN_PEAK = 8
-
-        private fun baseSuckMs(level: Int): Long = when (level) {
-            3 -> 2000L
-            2 -> 1500L
-            else -> 1200L
-        }
-
-        private const val SUCK_MAX_MS = 6000L
-        private const val VENT_MS = 700L
-        private const val SUCK_EXTEND_STEP_MS = 300L
-
-        // ================= CADENCIAS INDEPENDIENTES =================
-        // Objetivo de cadencia por canal (ms). Menor = más paquetes.
-        private const val CH1_TARGET_MS = 70L   // Vibración (imperceptible)
-        private const val CH2_TARGET_MS = 40L   // Succión (más paquetes para la bomba)
-
-        // Tick del loop de scheduling
-        private const val TICK_MS = 15L
     }
-
-    private var advertiser: BluetoothLeAdvertiser? = null
-    private var webSocket: WebSocket? = null
-    private val handler = Handler(Looper.getMainLooper())
-
-    private var currentWsStatus: String = "Disconnected"
-    private var currentBleStatus: String = "Ready"
-
-    // Vibración
-    private var currentVibrationLevel = 0
-    private var currentFunscriptInput = 0
-    private var lastSentCmd: ByteArray? = null
-
-    private var lastPacketReceivedTime = 0L
-    private val VIDEO_PAUSE_TIMEOUT_MS = 1200L
-
-    private var isSuctionEnabled = true
-
-    // Succión: máquina de estados (0 = IDLE, 1 = SUCK, 2 = VENT)
-    private var suctionState = 0
-    private var suctionTimerStart = 0L
-    private var suctionLevel = 0
-    private var suctionSuckMs = 1200L
-    private var suctionExtendAccum = 0L
-    private var lastExtendCheckTime = 0L
-
-    // Scheduler independiente
-    private var lastCh1Tx = 0L
-    private var lastCh2Tx = 0L
-
-    private val okHttpClient = OkHttpClient.Builder()
-        .pingInterval(10, TimeUnit.SECONDS)
-        .build()
-
-    private val loopRunnable = object : Runnable {
-        override fun run() {
-            manageHardware()
-            handler.postDelayed(this, TICK_MS)
-        }
-    }
-
-    private val bleCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-            currentBleStatus = "Advertising Active"
-        }
-        override fun onStartFailure(errorCode: Int) {
-            currentBleStatus = "BLE Error: $errorCode"
-            sendStatusUpdate(log = "BLE Error: $errorCode")
-        }
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        advertiser = btManager?.adapter?.bluetoothLeAdvertiser
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) return START_NOT_STICKY
-
-        when (intent.action) {
-            ACTION_START -> {
-                val url = intent.getStringExtra(EXTRA_WS_URL) ?: return START_NOT_STICKY
-                startForegroundNotification()
-                connectWebSocket(url)
-                handler.removeCallbacks(loopRunnable)
-                handler.post(loopRunnable)
-                transmitBle(CMD_CH1_STOP, force = true)
-                transmitBle(CMD_CH2_STOP, force = true)
-                sendStatusUpdate(log = "Puente listo (CH1=${CH1_TARGET_MS}ms / CH2=${CH2_TARGET_MS}ms)")
-            }
-            ACTION_STOP -> {
-                stopBridge()
-                stopSelf()
-            }
-            ACTION_TOGGLE_SUCTION -> {
-                isSuctionEnabled = !isSuctionEnabled
-                if (!isSuctionEnabled) {
-                    suctionState = 0
-                    suctionLevel = 0
-                    transmitBle(CMD_CH2_STOP, force = true)
-                }
-                startForegroundNotification()
-                sendStatusUpdate(log = if (isSuctionEnabled) "Succión: ON" else "Succión: OFF")
-            }
-            ACTION_TEST_LEVEL -> {
-                if (intent.hasExtra(EXTRA_VIBRATION_LEVEL)) {
-                    val lvl = intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0).coerceIn(0, 20)
-                    processInput(lvl)
-                }
-            }
-        }
-        return START_STICKY
-    }
-
-    private fun startForegroundNotification() {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "LS Intiface Bridge Service",
-            NotificationManager.IMPORTANCE_LOW
-        )
-        manager.createNotificationChannel(channel)
-
-        val stopIntent = Intent(this, BridgeService::class.java).apply { action = ACTION_STOP }
-        val stopPending = PendingIntent.getService(
-            this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val toggleIntent = Intent(this, BridgeService::class.java).apply { action = ACTION_TOGGLE_SUCTION }
-        val togglePending = PendingIntent.getService(
-            this, 1, toggleIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val suctionBtnLabel = if (isSuctionEnabled) "Succión: ON" else "Succión: OFF"
-
-        val notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("LS Intiface Bridge")
-            .setContentText(if (isSuctionEnabled) "CH1=${CH1_TARGET_MS}ms / CH2=${CH2_TARGET_MS}ms" else "Solo Vibración")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .addAction(Notification.Action.Builder(null, suctionBtnLabel, togglePending).build())
-            .addAction(Notification.Action.Builder(null, "Stop", stopPending).build())
-            .setOngoing(true)
-            .build()
-
-        startForeground(NOTIFICATION_ID, notification)
-    }
-
-    private fun connectWebSocket(url: String) {
-        disconnectWebSocket()
-        currentWsStatus = "Connecting..."
-        sendStatusUpdate(log = "Conectando a: $url")
-
-        val request = try {
-            Request.Builder().url(url).build()
-        } catch (e: Exception) {
-            currentWsStatus = "URL Inválida"
-            sendStatusUpdate(log = "Error de URL: ${e.message}")
-            return
-        }
-
-        webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(ws: WebSocket, response: Response) {
-                currentWsStatus = "Connected"
-                sendStatusUpdate(log = "Conectado. Handshake OK")
-                ws.send("{\"identifier\": \"LVSDevice\", \"address\": \"001122334455\", \"version\": 0}")
-            }
-
-            override fun onMessage(ws: WebSocket, text: String) {
-                handleLovenseMessage(text)
-            }
-
-            override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                handleLovenseMessage(bytes.utf8())
-            }
-
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                currentWsStatus = "Disconnected"
-                sendStatusUpdate(log = "WebSocket cerrado: $reason")
-            }
-
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                currentWsStatus = "Error"
-                sendStatusUpdate(log = "Fallo de conexión: ${t.message}")
-            }
-        })
-    }
-
-    private fun sendLovenseResponse(msg: String) {
-        val byteString = msg.encodeUtf8()
-        webSocket?.send(byteString)
-    }
-
-    private fun handleLovenseMessage(text: String) {
-        val parts = text.split(";")
-        for (part in parts) {
-            val cmd = part.trim()
-            if (cmd.isEmpty()) continue
-
-            when {
-                cmd.equals("DeviceType", ignoreCase = true) -> {
-                    sendLovenseResponse("P:11:001122334455;\r\n")
-                }
-                cmd.equals("Battery", ignoreCase = true) -> {
-                    sendLovenseResponse("90;\r\n")
-                }
-                cmd.startsWith("Vibrate:", ignoreCase = true) ||
-                cmd.startsWith("Vibrate1:", ignoreCase = true) -> {
-                    val rawValue = (cmd.substringAfter(":").trim().toIntOrNull() ?: 0).coerceIn(0, 20)
-                    processInput(rawValue)
-                }
-                cmd.equals("Stop", ignoreCase = true) -> {
-                    currentVibrationLevel = 0
-                    currentFunscriptInput = 0
-                    suctionState = 0
-                    suctionLevel = 0
-                    transmitBle(CMD_CH1_STOP, force = true)
-                    transmitBle(CMD_CH2_STOP, force = true)
-                    sendStatusUpdate(log = "Stop")
-                }
-            }
-        }
-    }
-
-    private fun processInput(rawValue: Int) {
-        val now = System.currentTimeMillis()
-        lastPacketReceivedTime = now
-        currentFunscriptInput = rawValue
-
-        // ===== VIBRACIÓN (idéntica a tu versión que te gusta) =====
-        val newVibeLevel = when {
-            rawValue >= 10   -> 3
-            rawValue in 5..9 -> 2
-            else             -> 0
-        }
-
-        if (newVibeLevel != currentVibrationLevel) {
-            currentVibrationLevel = newVibeLevel
-            applyVibrationHardware(force = true)
-            sendStatusUpdate(log = if (newVibeLevel > 0) "Vib: Nivel $newVibeLevel" else "Vib: 0")
-        }
-
-        // ===== SUCCIÓN =====
-        if (!isSuctionEnabled) return
-
-        if (suctionState == 0) {
-            val lvl = levelFromPeak(rawValue)
-            if (lvl > 0) {
-                startSuctionPulse(now, lvl)
-            }
-        }
-    }
-
-    private fun levelFromPeak(peak: Int): Int = when {
-        peak >= SUCTION_MIN_PEAK -> 1
-        else -> 0
-    }
-
-    private fun startSuctionPulse(now: Long, level: Int) {
-        suctionState = 1
-        suctionTimerStart = now
-        suctionLevel = 1
-        suctionSuckMs = baseSuckMs(level)
-        suctionExtendAccum = 0L
-        lastExtendCheckTime = now
-        applySuctionHardware(force = true)
-        sendStatusUpdate(log = "Suct: inicio ${suctionSuckMs}ms")
-    }
-
-    private fun manageHardware() {
-        val now = System.currentTimeMillis()
-
-        // 1. Parada si el vídeo se pausó
-        if ((currentVibrationLevel > 0 || suctionLevel > 0 || suctionState != 0) &&
-            (now - lastPacketReceivedTime > VIDEO_PAUSE_TIMEOUT_MS)) {
-            currentVibrationLevel = 0
-            suctionLevel = 0
-            suctionState = 0
-            currentFunscriptInput = 0
-            transmitBle(CMD_CH1_STOP, force = true)
-            transmitBle(CMD_CH2_STOP, force = true)
-            sendStatusUpdate(log = "Vídeo pausado -> Motores detenidos")
-            return
-        }
-
-        // 2. Máquina de estados de la succión
-        when (suctionState) {
-            1 -> { // SUCK
-                if (now - lastExtendCheckTime >= SUCK_EXTEND_STEP_MS) {
-                    lastExtendCheckTime = now
-                    if (currentFunscriptInput >= SUCTION_MIN_PEAK &&
-                        suctionExtendAccum + SUCK_EXTEND_STEP_MS <= SUCK_MAX_MS) {
-                        suctionSuckMs += SUCK_EXTEND_STEP_MS
-                        suctionExtendAccum += SUCK_EXTEND_STEP_MS
-                        sendStatusUpdate(log = "Suct: extendido a ${suctionSuckMs}ms")
-                    }
-                }
-
-                if (now - suctionTimerStart >= suctionSuckMs) {
-                    suctionState = 2
-                    suctionTimerStart = now
-                    suctionLevel = 0
-                    sendStatusUpdate(log = "Suct: venteo ${VENT_MS}ms")
-                }
-            }
-            2 -> { // VENT
-                if (currentFunscriptInput >= SUCTION_MIN_PEAK && now - suctionTimerStart >= 150L) {
-                    startSuctionPulse(now, levelFromPeak(currentFunscriptInput))
-                } else if (now - suctionTimerStart >= VENT_MS) {
-                    suctionState = 0
-                }
-            }
-        }
-
-        // 3. Scheduler con cadencias independientes
-        val ch1Overdue = now - lastCh1Tx
-        val ch2Overdue = now - lastCh2Tx
-
-        val wantCh1 = ch1Overdue >= CH1_TARGET_MS
-        val wantCh2 = (suctionState != 0) && ch2Overdue >= CH2_TARGET_MS
-
-        if (wantCh2 && wantCh1) {
-            // Ambos vencidos: comparamos cuánto de "vencidos" están en proporción
-            // a su cadencia objetivo. El más retrasado proporcionalmente va primero.
-            if (ch2Overdue * CH1_TARGET_MS >= ch1Overdue * CH2_TARGET_MS) {
-                if (suctionState == 1) applySuctionHardware() else transmitBle(CMD_CH2_STOP)
-                lastCh2Tx = now
-            } else {
-                applyVibrationHardware()
-                lastCh1Tx = now
-            }
-        } else if (wantCh2) {
-            if (suctionState == 1) applySuctionHardware() else transmitBle(CMD_CH2_STOP)
-            lastCh2Tx = now
-        } else if (wantCh1) {
-            applyVibrationHardware()
-            lastCh1Tx = now
-        }
-    }
-
-    private fun applyVibrationHardware(force: Boolean = false) {
-        val cmd = when (currentVibrationLevel) {
-            2 -> CMD_CH1_L2
-            3 -> CMD_CH1_L3
-            else -> CMD_CH1_STOP
-        }
-        transmitBle(cmd, force)
-    }
-
-    private fun applySuctionHardware(force: Boolean = false) {
-        val cmd = if (suctionLevel > 0) CMD_CH2_L1 else CMD_CH2_STOP
-        transmitBle(cmd, force)
-    }
-
-    private fun transmitBle(suffix: ByteArray, force: Boolean = false) {
-        val adv = advertiser ?: return
-
-        if (!force && lastSentCmd != null && lastSentCmd!!.contentEquals(suffix)) {
-            return
-        }
-        lastSentCmd = suffix.clone()
-
-        val payload = ByteArray(11)
-        System.arraycopy(PREFIX, 0, payload, 0, 8)
-        System.arraycopy(suffix, 0, payload, 8, 3)
-
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(true)
-            .setTimeout(0)
-            .build()
-
-        val data = AdvertiseData.Builder()
-            .addManufacturerData(0xFFF0, payload)
-            .build()
-
-        try {
-            adv.stopAdvertising(bleCallback)
-            adv.startAdvertising(settings, data, bleCallback)
-        } catch (ignored: Exception) {}
-    }
-
-    private fun sendStatusUpdate(log: String? = null) {
-        val intent = Intent(ACTION_STATUS).apply {
-            putExtra(EXTRA_WS_STATUS, currentWsStatus)
-            putExtra(EXTRA_BLE_STATUS, currentBleStatus)
-            putExtra(EXTRA_LEVEL, currentVibrationLevel)
-            putExtra(EXTRA_VIBRATION_LEVEL, currentVibrationLevel)
-            putExtra(EXTRA_ROTATION_LEVEL, if (suctionState == 1) 1 else 0)
-            putExtra(EXTRA_LOG, log ?: "")
-            setPackage(packageName)
-        }
-        sendBroadcast(intent)
-    }
-
-    private fun disconnectWebSocket() {
-        try {
-            webSocket?.close(1000, "Normal closure")
-        } catch (ignored: Exception) {}
-        webSocket = null
-    }
-
-    private fun stopBridge() {
-        handler.removeCallbacks(loopRunnable)
-        disconnectWebSocket()
-        transmitBle(CMD_CH1_STOP, force = true)
-        transmitBle(CMD_CH2_STOP, force = true)
-        try {
-            advertiser?.stopAdvertising(bleCallback)
-        } catch (ignored: Exception) {}
-        currentWsStatus = "Disconnected"
-        currentBleStatus = "Stopped"
-        sendStatusUpdate(log = "Bridge detenido")
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        stopBridge()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
 }
