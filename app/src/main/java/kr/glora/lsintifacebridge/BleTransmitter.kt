@@ -54,7 +54,7 @@ class BleTransmitter(
         if (closed) return
         if (inFlight != null || confirmed == command) return
         val now = SystemClock.elapsedRealtime()
-        val isStop = command == VIBRATION[0] || command == SUCTION[0]
+        val isStop = command == VIBRATION[0] || command == SUCTION[0] || command == GLOBAL_STOP
         if (!isStop && set != null && now - lastAppliedAt < 100L) return
         inFlight = command
         handler.postDelayed(timeout, 1000L)
@@ -112,6 +112,7 @@ class BleTransmitter(
     }
 
     companion object {
+        const val GLOBAL_STOP = 0xE5157D
         val VIBRATION = intArrayOf(0xD5964C, 0xD41F5D, 0xD7846F, 0xD60D7E)
         val SUCTION = intArrayOf(0xA5113F, 0xA4982E, 0xA7031C, 0xA68A0D)
         private val PREFIX = byteArrayOf(0x6D, 0xB6.toByte(), 0x43, 0xCE.toByte(),

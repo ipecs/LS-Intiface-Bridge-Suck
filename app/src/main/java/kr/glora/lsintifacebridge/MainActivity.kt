@@ -52,6 +52,8 @@ class MainActivity : ComponentActivity() {
     private var suctionEnabled by mutableStateOf(false)
     private var bridgeRunning by mutableStateOf(false)
     private var phase by mutableStateOf("IDLE")
+    private var stopReason by mutableStateOf("—")
+    private var remotePaused by mutableStateOf(false)
     private var followsVibration by mutableStateOf(true)
     private var threeLevels by mutableStateOf(false)
     private var pulseSeconds by mutableStateOf(0.7f)
@@ -87,6 +89,8 @@ class MainActivity : ComponentActivity() {
             suctionEnabled = intent.getBooleanExtra(BridgeService.EXTRA_SUCTION_ENABLED, false)
             bridgeRunning = intent.getBooleanExtra(BridgeService.EXTRA_RUNNING, false)
             phase = intent.getStringExtra(BridgeService.EXTRA_PHASE) ?: phase
+            stopReason = intent.getStringExtra(BridgeService.EXTRA_STOP_REASON) ?: stopReason
+            remotePaused = intent.getBooleanExtra(BridgeService.EXTRA_REMOTE_PAUSED, false)
             intent.getStringExtra(BridgeService.EXTRA_LOG)?.takeIf { it.isNotBlank() }?.let(::appendLog)
         }
     }
@@ -157,7 +161,7 @@ class MainActivity : ComponentActivity() {
                             onValueChangeFinished = { saveConfig() }, valueRange = 0.7f..5f, steps = 42)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Switch(checked = threeLevels, onCheckedChange = { threeLevels = it; saveConfig() })
-                            Text("Tres niveles por script (experimental)")
+                            Text("Tres comandos por script (experimental)")
                         }
                         Text("Probar primero sin contacto corporal. La parada de la bomba no confirma liberación del vacío.",
                             style = MaterialTheme.typography.bodySmall)
@@ -201,8 +205,14 @@ class MainActivity : ComponentActivity() {
                         }
 
                         Text("WebSocket: $webSocketStatus")
+                        if (remotePaused) Text("Script pausado. Start para reanudar.")
+                        Button(onClick = {
+                            startService(Intent(this@MainActivity, BridgeService::class.java)
+                                .setAction(BridgeService.ACTION_GLOBAL_STOP))
+                        }, enabled = bridgeRunning) { Text("Parada general y cerrar puente") }
                         Text("BLE: $bleStatus")
                         Text("Orden: Vib $vibeLovenseLevel / Succión $rotateLovenseLevel | $phase")
+                        Text("Causa de parada: $stopReason")
                         Spacer(Modifier.height(4.dp))
                         Text(
                             text = logText,

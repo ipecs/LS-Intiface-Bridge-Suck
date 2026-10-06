@@ -105,11 +105,20 @@ class ActuationControllerTest {
 
     @Test fun lowValuesStopVibrationAndExplicitZeroStopsPump() {
         val c = ready()
-        c.vibration(4, 0)
+        c.vibration(2, 0)
         assertEquals(0, c.vibrationLevel)
         c.suctionInput(20, 0)
         c.suctionInput(0, 100)
         assertEquals(ActuationController.Phase.STOPPING, c.phase)
+    }
+
+    @Test fun vibrationStartsAtThreeAndPreservesTheExistingHigherLevels() {
+        val c = ready()
+        for ((input, expected) in listOf(0 to 0, 2 to 0, 3 to 1, 4 to 1, 5 to 2,
+            9 to 2, 10 to 3, 20 to 3)) {
+            c.vibration(input, 0)
+            assertEquals("input=$input", expected, c.vibrationLevel)
+        }
     }
 
     @Test fun disablingSuctionRequestsStopEvenWhenTheAppBelievesItIsIdle() {
@@ -121,5 +130,64 @@ class ActuationControllerTest {
         c.tick(1010)
         assertEquals(ActuationController.Phase.IDLE, c.phase)
         assertEquals(3, c.vibrationLevel)
+    }
+
+    @Test fun reportedCutDistinguishesInputTimeoutFromPulseLimit() {
+        val c = ready()
+        c.configure(3000, 700, 0)
+        c.suctionInput(20, 0)
+        c.tick(1200)
+        assertEquals(ActuationController.StopReason.INPUT_TIMEOUT, c.stopReason)
+        c.suctionInput(0, 1300)
+        assertEquals(ActuationController.StopReason.INPUT_TIMEOUT, c.stopReason)
+        c.stopDataApplied(1300)
+        c.tick(2000)
+        assertTrue(c.manualPulse(1, 2000))
+        c.tick(3200)
+        assertEquals(ActuationController.Phase.SUCKING, c.phase)
+        c.tick(5000)
+        assertEquals(ActuationController.StopReason.PULSE_LIMIT, c.stopReason)
+    }
+
+    @Test fun freshGeneralStopCannotInheritAnAlmostFinishedCooldown() {
+        val c = ready()
+        c.stopAll()
+        c.stopDataApplied(0)
+        c.tick(999)
+        c.stopAll(restartHold = true)
+        c.tick(1100)
+        assertEquals(ActuationController.Phase.STOPPING, c.phase)
+        c.stopDataApplied(1100)
+        c.tick(2099)
+        assertEquals(ActuationController.Phase.COOLDOWN, c.phase)
+        c.tick(2100)
+        assertEquals(ActuationController.Phase.IDLE, c.phase)
+        assertEquals(0, c.suctionLevel)
+        assertEquals(0, c.vibrationLevel)
+    }
+
+    @Test fun scriptValuesCannotInterruptOrExtendAManualCycle() {
+        val c = ready()
+        c.configure(4900, 1000, 0)
+        assertTrue(c.manualPulse(3, 0))
+        c.suctionInput(0, 100)
+        c.suctionInput(8, 200)
+        c.suctionInput(20, 4000)
+        c.tick(4899)
+        assertEquals(ActuationController.Phase.SUCKING, c.phase)
+        assertEquals(3, c.suctionLevel)
+        c.tick(4900)
+        assertEquals(ActuationController.Phase.STOPPING, c.phase)
+        assertEquals(ActuationController.StopReason.PULSE_LIMIT, c.stopReason)
+    }
+
+    @Test fun manualCycleStillObeysExplicitStopAndDisconnect() {
+        val c = ready()
+        c.configure(4900, 1000, 0)
+        assertTrue(c.manualPulse(3, 0))
+        c.stopAll(ActuationController.StopReason.CONNECTION_LOST)
+        assertEquals(ActuationController.Phase.STOPPING, c.phase)
+        assertEquals(0, c.suctionLevel)
+        assertEquals(ActuationController.StopReason.CONNECTION_LOST, c.stopReason)
     }
 }

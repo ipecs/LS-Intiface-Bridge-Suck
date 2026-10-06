@@ -21,6 +21,8 @@ class BridgeService : Service() {
     private var session = 0
     private var running = false
     private var shuttingDown = false
+    private var generalStopRequested = false
+    private var remoteOutputsPaused = false
     private var shutdownStart = 0L
     private var stopVibrationAppliedAt: Long? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -37,11 +39,13 @@ class BridgeService : Service() {
             controller.tick(now)
             val command = if (controller.phase == ActuationController.Phase.IDLE) {
                 BleTransmitter.VIBRATION[controller.vibrationLevel]
+            } else if (generalStopRequested) {
+                BleTransmitter.GLOBAL_STOP
             } else {
                 BleTransmitter.SUCTION[controller.suctionLevel]
             }
             radio?.request(command)
-            if (command == BleTransmitter.SUCTION[0] && radio?.confirmed == command) {
+            if ((command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) && radio?.confirmed == command) {
                 controller.stopDataApplied(now)
             }
             if (shuttingDown) {
@@ -76,30 +80,38 @@ class BridgeService : Service() {
                 if (!ensureRunning()) return START_NOT_STICKY
                 controller.setSuctionEnabled(false)
                 controller.stopAll()
+                remoteOutputsPaused = false
                 notification()
                 connect(intent.getStringExtra(EXTRA_WS_URL).orEmpty())
             }
-            ACTION_STOP -> if (running) {
+            ACTION_STOP, ACTION_GLOBAL_STOP -> if (running) {
                 shuttingDown = true
+                generalStopRequested = generalStopRequested || intent.action == ACTION_GLOBAL_STOP
                 shutdownStart = now()
                 stopVibrationAppliedAt = null
                 disconnect()
-                controller.stopAll()
-                publish("Parando ambos canales antes de cerrar la emisión")
+                controller.stopAll(restartHold = intent.action == ACTION_GLOBAL_STOP)
+                publish(if (generalStopRequested) "Parada general solicitada; liberación del vacío por comprobar"
+                    else "Parando ambos canales antes de cerrar la emisión")
             } else stopSelf()
             ACTION_OFF -> if (running) {
+                remoteOutputsPaused = true
+                controller.setSuctionEnabled(false)
                 controller.stopAll()
-                publish("Parada solicitada")
+                notification()
+                publish("Off: salidas del script pausadas y succión deshabilitada; Start para reanudar")
             } else stopSelf()
             ACTION_TOGGLE_SUCTION -> {
                 if (running && !shuttingDown) {
                     controller.setSuctionEnabled(intent.getBooleanExtra(EXTRA_SUCTION_ENABLED, !controller.suctionEnabled))
                     notification()
-                    publish("Succión ${if (controller.suctionEnabled) "habilitada: esperando pico nuevo" else "deshabilitada"}")
+                    publish(if (!controller.suctionEnabled) "Succión deshabilitada"
+                        else if (remoteOutputsPaused) "Succión habilitada para pruebas locales; Start para reanudar script"
+                        else "Succión habilitada: esperando pico nuevo")
                 } else if (!running) stopSelf()
             }
             ACTION_CONFIG -> {
-                controller.stopAll()
+                controller.stopAll(ActuationController.StopReason.SETTINGS_CHANGED)
                 controller.configure(intent.getLongExtra(EXTRA_PULSE_MS, controller.pulseMs),
                     intent.getLongExtra(EXTRA_COOLDOWN_MS, controller.cooldownMs), now())
                 followsVibration = intent.getBooleanExtra(EXTRA_FOLLOW_VIBRATION, followsVibration)
@@ -117,7 +129,10 @@ class BridgeService : Service() {
                     if (intent.hasExtra(EXTRA_ROTATION_LEVEL)) {
                         val level = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0)
                         if (level == 0) controller.stopAll()
-                        else if (!controller.manualPulse(level, now())) {
+                        else if (controller.manualPulse(level, now())) {
+                            remoteOutputsPaused = true
+                            publish("Prueba de succión aislada del script; Start para reanudar el script después")
+                        } else {
                             publish("Prueba no iniciada: habilitar succión y esperar a que termine el descanso")
                         }
                     }
@@ -155,17 +170,17 @@ class BridgeService : Service() {
             val now = now()
             controller.tick(now)
             bleStatus = "Android aceptó %06X".format(command)
-            if (command == BleTransmitter.SUCTION[0]) controller.stopDataApplied(now)
+            if (command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) controller.stopDataApplied(now)
             if (shuttingDown && command == BleTransmitter.VIBRATION[0] &&
                 controller.phase == ActuationController.Phase.IDLE) stopVibrationAppliedAt = now
             if (command in BleTransmitter.SUCTION.drop(1) &&
                 controller.phase != ActuationController.Phase.SUCKING) {
-                radio?.request(BleTransmitter.SUCTION[0])
+                radio?.request(if (generalStopRequested) BleTransmitter.GLOBAL_STOP else BleTransmitter.SUCTION[0])
             }
             publish(bleStatus)
         }, { message ->
             controller.setSuctionEnabled(false)
-            controller.stopAll()
+            controller.stopAll(ActuationController.StopReason.RADIO_FAILURE)
             bleStatus = "Error BLE"
             notification()
             publish(message)
@@ -204,14 +219,14 @@ class BridgeService : Service() {
                 if (reply.isNotEmpty()) ws.send(reply.encodeUtf8())
             }
             override fun onClosing(ws: WebSocket, code: Int, reason: String) = onMain(ws) {
-                controller.stopAll()
+                controller.stopAll(ActuationController.StopReason.CONNECTION_LOST)
                 ws.close(code, reason)
             }
             override fun onClosed(ws: WebSocket, code: Int, reason: String) = onMain(ws) {
-                wsStatus = "Disconnected"; controller.stopAll(); publish("WebSocket cerrado: $reason")
+                wsStatus = "Disconnected"; controller.stopAll(ActuationController.StopReason.CONNECTION_LOST); publish("WebSocket cerrado: $reason")
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) = onMain(ws) {
-                wsStatus = "Error"; controller.stopAll(); publish("Conexión perdida: ${t.message}")
+                wsStatus = "Error"; controller.stopAll(ActuationController.StopReason.CONNECTION_LOST); publish("Conexión perdida: ${t.message}")
             }
         })
         publish("Conectando a Intiface")
@@ -224,14 +239,16 @@ class BridgeService : Service() {
         "autoswitch", "rotatechange" -> "OK;"
         "vibrate", "vibrate1" -> {
             if (value == null || value !in 0..20) "ERR;" else {
-                controller.vibration(value, now())
-                if (followsVibration) controller.suctionInput(value, now(), stopOnZero = false)
+                if (!remoteOutputsPaused) {
+                    controller.vibration(value, now())
+                    if (followsVibration) controller.suctionInput(value, now(), stopOnZero = false)
+                }
                 "OK;"
             }
         }
         "rotate", "vibrate2" -> {
             if (value == null || value !in 0..20) "ERR;" else {
-                if (!followsVibration) controller.suctionInput(value, now())
+                if (!remoteOutputsPaused && !followsVibration) controller.suctionInput(value, now())
                 "OK;"
             }
         }
@@ -276,7 +293,7 @@ class BridgeService : Service() {
     }
 
     private fun publish(log: String = "", force: Boolean = false) {
-        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.suctionLevel}|${controller.phase}|${controller.suctionEnabled}|$running"
+        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.suctionLevel}|${controller.phase}|${controller.stopReason}|${controller.suctionEnabled}|$running|$remoteOutputsPaused"
         if (!force && log.isEmpty() && snapshot == lastSnapshot) return
         lastSnapshot = snapshot
         sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName)
@@ -285,7 +302,19 @@ class BridgeService : Service() {
             .putExtra(EXTRA_VIBRATION_LEVEL, controller.vibrationInput)
             .putExtra(EXTRA_ROTATION_LEVEL, controller.suctionLevel)
             .putExtra(EXTRA_SUCTION_ENABLED, controller.suctionEnabled)
+            .putExtra(EXTRA_REMOTE_PAUSED, remoteOutputsPaused)
             .putExtra(EXTRA_PHASE, controller.phase.name).putExtra(EXTRA_RUNNING, running)
+            .putExtra(EXTRA_STOP_REASON, when (controller.stopReason) {
+                ActuationController.StopReason.NONE -> "—"
+                ActuationController.StopReason.PULSE_LIMIT -> "Tiempo de pulso cumplido"
+                ActuationController.StopReason.INPUT_TIMEOUT -> "Sin valor nuevo durante 1,2 s"
+                ActuationController.StopReason.ZERO_COMMAND -> "Orden Rotate:0"
+                ActuationController.StopReason.DISABLED -> "Succión deshabilitada"
+                ActuationController.StopReason.SETTINGS_CHANGED -> "Cambio de ajustes"
+                ActuationController.StopReason.MANUAL_STOP -> "Orden de parada"
+                ActuationController.StopReason.CONNECTION_LOST -> "Conexión perdida"
+                ActuationController.StopReason.RADIO_FAILURE -> "Error Bluetooth"
+            })
             .putExtra(EXTRA_LOG, log))
     }
 
@@ -309,6 +338,7 @@ class BridgeService : Service() {
         const val ACTION_TOGGLE_SUCTION = "kr.glora.lsintifacebridge.ACTION_TOGGLE_SUCTION"
         const val ACTION_CONFIG = "kr.glora.lsintifacebridge.ACTION_CONFIG"
         const val ACTION_OFF = "kr.glora.lsintifacebridge.ACTION_OFF"
+        const val ACTION_GLOBAL_STOP = "kr.glora.lsintifacebridge.ACTION_GLOBAL_STOP"
         const val ACTION_GET_STATUS = "kr.glora.lsintifacebridge.ACTION_GET_STATUS"
         const val EXTRA_WS_URL = "extra_ws_url"
         const val EXTRA_WS_STATUS = "extra_ws_status"
@@ -323,7 +353,9 @@ class BridgeService : Service() {
         const val EXTRA_FOLLOW_VIBRATION = "follow_vibration"
         const val EXTRA_THREE_LEVELS = "three_levels"
         const val EXTRA_PHASE = "phase"
+        const val EXTRA_STOP_REASON = "stop_reason"
         const val EXTRA_RUNNING = "running"
+        const val EXTRA_REMOTE_PAUSED = "remote_paused"
         private const val CHANNEL_ID = "ls_bridge_channel"
         private const val NOTIFICATION_ID = 1001
     }
