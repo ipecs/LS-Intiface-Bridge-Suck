@@ -23,6 +23,7 @@ class BleTransmitter(
     private var inFlight: Int? = null
     private var closed = false
     val isClosed: Boolean get() = closed
+    val hasPendingOperation: Boolean get() = inFlight != null
     private var failures = 0
     private var lastAppliedAt = 0L
 

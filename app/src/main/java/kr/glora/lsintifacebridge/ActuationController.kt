@@ -1,47 +1,72 @@
 package kr.glora.lsintifacebridge
 
-/** Pure state machine. All times are supplied by a monotonic clock. No RF acknowledgements. */
+/** Serialized, bounded pulses. Android accepting data is not a toy acknowledgement. */
 class ActuationController {
-    enum class Phase { IDLE, SUCKING, STOPPING, COOLDOWN }
-    enum class StopReason { NONE, PULSE_LIMIT, INPUT_TIMEOUT, ZERO_COMMAND, DISABLED,
+    enum class Phase { IDLE, STARTING, SUCKING, BETWEEN_STOPPING, BETWEEN_WAIT,
+        SECOND_STARTING, SECOND_PULSE, STOPPING, COOLDOWN }
+    enum class StopReason { NONE, PULSE_LIMIT, SEQUENCE_COMPLETE, ZERO_COMMAND, DISABLED,
         SETTINGS_CHANGED, MANUAL_STOP, CONNECTION_LOST, RADIO_FAILURE }
 
     var stopReason = StopReason.NONE
         private set
-
     var phase = Phase.IDLE
         private set
     var vibrationInput = 0
         private set
     var vibrationLevel = 0
         private set
+    var suctionInputValue = 0
+        private set
     var suctionLevel = 0
         private set
     var suctionEnabled = false
         private set
-    var pulseMs = 700L
+    var pulseMs = 2300L
         private set
     var cooldownMs = 1000L
         private set
-    var threeLevels = false
-    private var armed = true
-    private var pulseDeadline = 0L
-    private var cooldownDeadline = 0L
-    private var vibrationExpiry = 0L
-    private var suctionExpiry = 0L
-    private var manualPulseActive = false
+    var scriptCommand = 2
+        private set
+    var triggerAt = 3
+        private set
+    var secondPulseEnabled = false
+        private set
+    var acceptedPeaks = 0
+        private set
+    var skippedPeaks = 0
+        private set
 
-    fun configure(pulse: Long, cooldown: Long, now: Long) {
-        pulseMs = pulse.coerceIn(700L, HARD_MAX_MS)
+    val pumpActive: Boolean get() = phase in listOf(Phase.STARTING, Phase.SUCKING,
+        Phase.SECOND_STARTING, Phase.SECOND_PULSE)
+    private var pumpDeadline = 0L
+    private var stopDeadline = 0L
+    private var vibrationExpiry = 0L
+    private var manualCycle = false
+    private var cycleCommand = 0
+    private var cycleHasSecondPulse = false
+    private var peakSeeded = false
+    private var risingArmed = false
+    private var high = 0
+    private var low = 0
+
+    fun configure(pulse: Long, cooldown: Long, now: Long, command: Int = scriptCommand,
+        threshold: Int = triggerAt, secondPulse: Boolean = secondPulseEnabled) {
+        scriptCommand = command.coerceIn(1, 3)
+        secondPulseEnabled = secondPulse && scriptCommand == 2
+        // Total requested pump-on time remains at most 5 seconds, including the extra step.
+        pulseMs = pulse.coerceIn(700L, HARD_MAX_MS - if (secondPulseEnabled) SECOND_PULSE_MS else 0L)
         cooldownMs = cooldown.coerceIn(700L, 5000L)
-        // Changing settings cannot lengthen a running pulse or shorten its stop hold.
-        if (phase == Phase.SUCKING) stopSuction(StopReason.SETTINGS_CHANGED)
-        if (phase == Phase.COOLDOWN) cooldownDeadline = maxOf(cooldownDeadline, now + cooldownMs)
+        triggerAt = threshold.coerceIn(1, 20)
+        resetPeakDetector()
+        if (phase !in listOf(Phase.IDLE, Phase.STOPPING, Phase.COOLDOWN)) {
+            stopSuction(StopReason.SETTINGS_CHANGED)
+        }
+        if (phase == Phase.COOLDOWN) stopDeadline = maxOf(stopDeadline, now + cooldownMs)
     }
 
     fun setSuctionEnabled(enabled: Boolean) {
         suctionEnabled = enabled
-        armed = false // A fresh low value, then a fresh peak, must follow re-enabling.
+        resetPeakDetector()
         if (!enabled) {
             stopSuction(StopReason.DISABLED)
             if (phase == Phase.IDLE) phase = Phase.STOPPING
@@ -61,69 +86,125 @@ class ActuationController {
 
     fun suctionInput(level: Int, now: Long, stopOnZero: Boolean = true) {
         tick(now)
-        // A local test owns its duration. Stream values cannot interrupt or extend it.
-        if (manualPulseActive) return
         val value = level.coerceIn(0, 20)
-        suctionExpiry = now + STREAM_TIMEOUT_MS
-        if (value == 0 && stopOnZero) {
-            if (phase == Phase.IDLE && suctionEnabled) armed = true else stopSuction(StopReason.ZERO_COMMAND)
+        suctionInputValue = value
+        if (manualCycle || !suctionEnabled) return
+        val newPeak = observePeak(value)
+        if (value == 0 && stopOnZero && phase !in listOf(Phase.IDLE, Phase.COOLDOWN, Phase.STOPPING)) {
+            stopSuction(StopReason.ZERO_COMMAND)
             return
         }
-        if (!suctionEnabled || phase != Phase.IDLE) return
-        if (value < REARM_BELOW) armed = true
-        if (armed && value >= TRIGGER_AT) {
-            val mode = if (!threeLevels) 1 else when (value) {
-                in 16..20 -> 3
-                in 12..15 -> 2
-                else -> 1
-            }
-            startPulse(mode, now)
+        if (!newPeak) return
+        if (phase == Phase.IDLE) {
+            acceptedPeaks++
+            startCycle(scriptCommand, now)
+        } else {
+            // Consume busy peaks immediately. There is no delayed replay or command backlog.
+            skippedPeaks++
         }
+    }
+
+    /** Detect a fresh rise, including when its preceding fall happened during a busy cycle. */
+    private fun observePeak(value: Int): Boolean {
+        if (!peakSeeded) {
+            peakSeeded = true
+            high = value
+            low = value
+            risingArmed = value < triggerAt
+            return false
+        }
+        if (!risingArmed) {
+            high = maxOf(high, value)
+            if (value < triggerAt || high - value >= PEAK_DELTA) {
+                risingArmed = true
+                low = value
+            }
+            return false
+        }
+        low = minOf(low, value)
+        val riseNeeded = minOf(PEAK_DELTA, triggerAt)
+        if (value >= triggerAt && value - low >= riseNeeded) {
+            risingArmed = false
+            high = value
+            return true
+        }
+        return false
+    }
+
+    private fun resetPeakDetector() {
+        peakSeeded = false
+        risingArmed = false
+        suctionInputValue = 0
     }
 
     fun manualPulse(level: Int, now: Long): Boolean {
         tick(now)
         if (!suctionEnabled || phase != Phase.IDLE || level !in 1..3) return false
-        startPulse(level, now)
-        manualPulseActive = true
-        suctionExpiry = pulseDeadline // Local tests have their own bounded lifetime.
+        startCycle(level, now)
+        manualCycle = true
         return true
     }
 
-    private fun startPulse(level: Int, now: Long) {
-        manualPulseActive = false
-        armed = false
+    private fun startCycle(level: Int, now: Long) {
+        manualCycle = false
+        cycleCommand = level
+        cycleHasSecondPulse = secondPulseEnabled && level == 2
         suctionLevel = level
-        phase = Phase.SUCKING
+        phase = Phase.STARTING
         stopReason = StopReason.NONE
-        pulseDeadline = now + pulseMs.coerceAtMost(HARD_MAX_MS)
+        pumpDeadline = now + START_TIMEOUT_MS
     }
 
-    private fun stopSuction(reason: StopReason) {
-        if (phase == Phase.SUCKING || (phase == Phase.IDLE && reason == StopReason.DISABLED)) {
+    /** Begin the selected duration only after Android accepts this stage's command. */
+    fun pumpDataApplied(level: Int, now: Long) {
+        if (level != cycleCommand) return
+        when (phase) {
+            Phase.STARTING -> {
+                phase = Phase.SUCKING
+                pumpDeadline = now + pulseMs
+            }
+            Phase.SECOND_STARTING -> {
+                phase = Phase.SECOND_PULSE
+                pumpDeadline = now + SECOND_PULSE_MS
+            }
+            else -> Unit // Late/repeated callbacks cannot restart a timer or another cycle.
+        }
+    }
+
+    private fun stopSuction(reason: StopReason, resetDetector: Boolean = true) {
+        if (phase !in listOf(Phase.STOPPING, Phase.COOLDOWN) || reason == StopReason.DISABLED) {
             stopReason = reason
         }
-        if (phase == Phase.SUCKING) phase = Phase.STOPPING
+        if (phase != Phase.IDLE && phase != Phase.COOLDOWN) phase = Phase.STOPPING
         suctionLevel = 0
-        armed = false
-        manualPulseActive = false
+        manualCycle = false
+        cycleHasSecondPulse = false
+        if (resetDetector) resetPeakDetector()
     }
 
     fun stopAll(reason: StopReason = StopReason.MANUAL_STOP, restartHold: Boolean = false) {
         vibrationInput = 0
         vibrationLevel = 0
         suctionLevel = 0
-        armed = false
-        manualPulseActive = false
+        manualCycle = false
+        cycleHasSecondPulse = false
+        resetPeakDetector()
         stopReason = reason
         if (restartHold || phase != Phase.COOLDOWN) phase = Phase.STOPPING
     }
 
-    /** Android accepted CH2 STOP data. This does not prove the toy received it or vented. */
+    /** A stop hold starts only after Android accepts stop data, never before. */
     fun stopDataApplied(now: Long) {
-        if (phase == Phase.STOPPING) {
-            phase = Phase.COOLDOWN
-            cooldownDeadline = now + cooldownMs
+        when (phase) {
+            Phase.BETWEEN_STOPPING -> {
+                phase = Phase.BETWEEN_WAIT
+                stopDeadline = now + cooldownMs
+            }
+            Phase.STOPPING -> {
+                phase = Phase.COOLDOWN
+                stopDeadline = now + cooldownMs
+            }
+            else -> Unit
         }
     }
 
@@ -132,17 +213,36 @@ class ActuationController {
             vibrationInput = 0
             vibrationLevel = 0
         }
-        if (phase == Phase.SUCKING) {
-            if (now >= pulseDeadline) stopSuction(StopReason.PULSE_LIMIT)
-            else if (now >= suctionExpiry) stopSuction(StopReason.INPUT_TIMEOUT)
+        when (phase) {
+            Phase.STARTING, Phase.SECOND_STARTING -> if (now >= pumpDeadline) {
+                stopSuction(StopReason.RADIO_FAILURE)
+            }
+            Phase.SUCKING -> if (now >= pumpDeadline) {
+                if (cycleHasSecondPulse) {
+                    suctionLevel = 0
+                    phase = Phase.BETWEEN_STOPPING
+                    stopReason = StopReason.PULSE_LIMIT
+                } else stopSuction(StopReason.PULSE_LIMIT, resetDetector = false)
+            }
+            Phase.BETWEEN_WAIT -> if (now >= stopDeadline) {
+                suctionLevel = cycleCommand
+                phase = Phase.SECOND_STARTING
+                pumpDeadline = now + START_TIMEOUT_MS
+            }
+            Phase.SECOND_PULSE -> if (now >= pumpDeadline) {
+                stopSuction(StopReason.SEQUENCE_COMPLETE, resetDetector = false)
+            }
+            Phase.COOLDOWN -> if (now >= stopDeadline) phase = Phase.IDLE
+            else -> Unit
         }
-        if (phase == Phase.COOLDOWN && now >= cooldownDeadline) phase = Phase.IDLE
     }
 
     companion object {
         const val HARD_MAX_MS = 5000L
+        const val SECOND_PULSE_MS = 1000L
+        // Allow an existing advertising update (1 s), this update (1 s), and scheduling margin.
+        const val START_TIMEOUT_MS = 2500L
         const val STREAM_TIMEOUT_MS = 1200L
-        const val TRIGGER_AT = 8
-        const val REARM_BELOW = 5
+        const val PEAK_DELTA = 2
     }
 }

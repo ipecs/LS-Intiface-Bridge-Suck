@@ -45,7 +45,8 @@ class BridgeService : Service() {
                 BleTransmitter.SUCTION[controller.suctionLevel]
             }
             radio?.request(command)
-            if ((command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) && radio?.confirmed == command) {
+            if ((command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) &&
+                radio?.confirmed == command && radio?.hasPendingOperation == false) {
                 controller.stopDataApplied(now)
             }
             if (shuttingDown) {
@@ -68,8 +69,9 @@ class BridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         followsVibration = prefs.getBoolean("follow_vibration", true)
-        controller.configure(prefs.getLong("pulse_ms", 700L), prefs.getLong("cooldown_ms", 1000L), now())
-        controller.threeLevels = prefs.getBoolean("three_levels", false)
+        controller.configure(prefs.getLong("pulse_ms", 2300L), prefs.getLong("cooldown_ms", 1000L), now(),
+            prefs.getInt("suction_command", 2), prefs.getInt("trigger_at", 3),
+            prefs.getBoolean("second_pulse", false))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -113,11 +115,14 @@ class BridgeService : Service() {
             ACTION_CONFIG -> {
                 controller.stopAll(ActuationController.StopReason.SETTINGS_CHANGED)
                 controller.configure(intent.getLongExtra(EXTRA_PULSE_MS, controller.pulseMs),
-                    intent.getLongExtra(EXTRA_COOLDOWN_MS, controller.cooldownMs), now())
+                    intent.getLongExtra(EXTRA_COOLDOWN_MS, controller.cooldownMs), now(),
+                    intent.getIntExtra(EXTRA_SUCTION_COMMAND, controller.scriptCommand),
+                    intent.getIntExtra(EXTRA_TRIGGER_AT, controller.triggerAt),
+                    intent.getBooleanExtra(EXTRA_SECOND_PULSE, controller.secondPulseEnabled))
                 followsVibration = intent.getBooleanExtra(EXTRA_FOLLOW_VIBRATION, followsVibration)
-                controller.threeLevels = intent.getBooleanExtra(EXTRA_THREE_LEVELS, controller.threeLevels)
                 prefs.edit().putLong("pulse_ms", controller.pulseMs).putLong("cooldown_ms", controller.cooldownMs)
-                    .putBoolean("follow_vibration", followsVibration).putBoolean("three_levels", controller.threeLevels).apply()
+                    .putBoolean("follow_vibration", followsVibration).putInt("suction_command", controller.scriptCommand)
+                    .putInt("trigger_at", controller.triggerAt).putBoolean("second_pulse", controller.secondPulseEnabled).apply()
                 publish("Ajustes guardados; ciclo detenido")
                 if (!running) stopSelf()
             }
@@ -136,7 +141,9 @@ class BridgeService : Service() {
                             publish("Prueba no iniciada: habilitar succión y esperar a que termine el descanso")
                         }
                     }
-                    publish("Prueba local: vibración limitada a 2 s; succión limitada al ajuste de pulso")
+                    publish(if (controller.secondPulseEnabled)
+                        "Prueba local: pulso principal, pausa, segundo pulso de 1 s y descanso"
+                        else "Prueba local: vibración limitada a 2 s; succión limitada al ajuste de pulso")
                 }
             }
             ACTION_GET_STATUS -> { publish(force = true); if (!running) stopSelf() }
@@ -171,10 +178,12 @@ class BridgeService : Service() {
             controller.tick(now)
             bleStatus = "Android aceptó %06X".format(command)
             if (command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) controller.stopDataApplied(now)
+            val pumpLevel = BleTransmitter.SUCTION.indexOf(command)
+            if (pumpLevel > 0) controller.pumpDataApplied(pumpLevel, now)
             if (shuttingDown && command == BleTransmitter.VIBRATION[0] &&
                 controller.phase == ActuationController.Phase.IDLE) stopVibrationAppliedAt = now
             if (command in BleTransmitter.SUCTION.drop(1) &&
-                controller.phase != ActuationController.Phase.SUCKING) {
+                !controller.pumpActive) {
                 radio?.request(if (generalStopRequested) BleTransmitter.GLOBAL_STOP else BleTransmitter.SUCTION[0])
             }
             publish(bleStatus)
@@ -241,19 +250,30 @@ class BridgeService : Service() {
             if (value == null || value !in 0..20) "ERR;" else {
                 if (!remoteOutputsPaused) {
                     controller.vibration(value, now())
-                    if (followsVibration) controller.suctionInput(value, now(), stopOnZero = false)
+                    if (followsVibration) suctionSample(value, stopOnZero = false)
                 }
                 "OK;"
             }
         }
         "rotate", "vibrate2" -> {
             if (value == null || value !in 0..20) "ERR;" else {
-                if (!remoteOutputsPaused && !followsVibration) controller.suctionInput(value, now())
+                if (!remoteOutputsPaused && !followsVibration) suctionSample(value)
                 "OK;"
             }
         }
         "stop", "stopdevice", "poweroff" -> { controller.stopAll(); "OK;" }
         else -> "ERR;"
+    }
+
+    private fun suctionSample(value: Int, stopOnZero: Boolean = true) {
+        val previousAccepted = controller.acceptedPeaks
+        val previousSkipped = controller.skippedPeaks
+        controller.suctionInput(value, now(), stopOnZero)
+        if (controller.acceptedPeaks > previousAccepted) {
+            publish("Subida $value/20: disparo de comando ${controller.scriptCommand}")
+        } else if (controller.skippedPeaks > previousSkipped) {
+            publish("Subida $value/20 omitida: secuencia ocupada")
+        }
     }
 
     private fun disconnect() {
@@ -293,7 +313,7 @@ class BridgeService : Service() {
     }
 
     private fun publish(log: String = "", force: Boolean = false) {
-        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.suctionLevel}|${controller.phase}|${controller.stopReason}|${controller.suctionEnabled}|$running|$remoteOutputsPaused"
+        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.suctionLevel}|${controller.phase}|${controller.stopReason}|${controller.suctionEnabled}|$running|$remoteOutputsPaused|${controller.suctionInputValue}|${controller.acceptedPeaks}|${controller.skippedPeaks}"
         if (!force && log.isEmpty() && snapshot == lastSnapshot) return
         lastSnapshot = snapshot
         sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName)
@@ -303,11 +323,14 @@ class BridgeService : Service() {
             .putExtra(EXTRA_ROTATION_LEVEL, controller.suctionLevel)
             .putExtra(EXTRA_SUCTION_ENABLED, controller.suctionEnabled)
             .putExtra(EXTRA_REMOTE_PAUSED, remoteOutputsPaused)
+            .putExtra(EXTRA_SUCTION_INPUT, controller.suctionInputValue)
+            .putExtra(EXTRA_ACCEPTED_PEAKS, controller.acceptedPeaks)
+            .putExtra(EXTRA_SKIPPED_PEAKS, controller.skippedPeaks)
             .putExtra(EXTRA_PHASE, controller.phase.name).putExtra(EXTRA_RUNNING, running)
             .putExtra(EXTRA_STOP_REASON, when (controller.stopReason) {
                 ActuationController.StopReason.NONE -> "—"
                 ActuationController.StopReason.PULSE_LIMIT -> "Tiempo de pulso cumplido"
-                ActuationController.StopReason.INPUT_TIMEOUT -> "Sin valor nuevo durante 1,2 s"
+                ActuationController.StopReason.SEQUENCE_COMPLETE -> "Segundo pulso de prueba terminado"
                 ActuationController.StopReason.ZERO_COMMAND -> "Orden Rotate:0"
                 ActuationController.StopReason.DISABLED -> "Succión deshabilitada"
                 ActuationController.StopReason.SETTINGS_CHANGED -> "Cambio de ajustes"
@@ -351,7 +374,12 @@ class BridgeService : Service() {
         const val EXTRA_PULSE_MS = "pulse_ms"
         const val EXTRA_COOLDOWN_MS = "cooldown_ms"
         const val EXTRA_FOLLOW_VIBRATION = "follow_vibration"
-        const val EXTRA_THREE_LEVELS = "three_levels"
+        const val EXTRA_SUCTION_COMMAND = "suction_command"
+        const val EXTRA_TRIGGER_AT = "trigger_at"
+        const val EXTRA_SECOND_PULSE = "second_pulse"
+        const val EXTRA_SUCTION_INPUT = "suction_input"
+        const val EXTRA_ACCEPTED_PEAKS = "accepted_peaks"
+        const val EXTRA_SKIPPED_PEAKS = "skipped_peaks"
         const val EXTRA_PHASE = "phase"
         const val EXTRA_STOP_REASON = "stop_reason"
         const val EXTRA_RUNNING = "running"
