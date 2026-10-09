@@ -1,6 +1,6 @@
 # LS Intiface Bridge
 
-Android 12+ bridge for LoveSpouse/MuSe HB2451, targeting Android 15. Version 1.5 adds optional, sparse suction accents on rising script intensity while retaining the 1.4 vibration scale and scheduler. It emulates a single Lovense Hush vibrator (`Z`), following the [official WSDM example](https://buttplug.io/docs/spec-v3/dev-guide/inflating-buttplug/devices/websocket-device-manager/). WebSocket port remains 54817 and handshake identifier remains `LVSDevice`. When upgrading from an older Nora profile, remove that entry and select the new Hush in Intiface and the player.
+Android 12+ bridge for LoveSpouse/MuSe HB2451, targeting Android 15. Version 1.6 fixes enabling the suction accents introduced in 1.5: a user-observed release can be recorded from an earlier session, survives a service restart for identical pump settings, and enabling accents resumes script output after a local test. It emulates a single Lovense Hush vibrator (`Z`), following the [official WSDM example](https://buttplug.io/docs/spec-v3/dev-guide/inflating-buttplug/devices/websocket-device-manager/). WebSocket port remains 54817 and handshake identifier remains `LVSDevice`. When upgrading from an older Nora profile, remove that entry and select the new Hush in Intiface and the player.
 
 ## Intended pattern and its limits
 
@@ -12,7 +12,7 @@ The app exposes threshold, minimum start interval, main pulse duration, intermed
 
 ## Check release before enabling repetition
 
-Repeated automatic suction is disabled until the user has completed and confirmed the manual command-2 two-pulse test for the current timing settings. No pressure sensor or verified valve-open opcode is available. Stopping the pump is not evidence that vacuum has been released; the user reported that Off and the global stop do not release it on their unit.
+Automatic suction requires an explicit user confirmation that the command-2 two-pulse sequence releases all air with the current timing settings. The user has now reported that the second pulse releases all air on their unit. The app can record that observation without demanding another in-app manual test. No pressure sensor or verified valve-open opcode is available. Stopping the pump alone is not evidence that vacuum has been released; the user reported that Off and the global stop do not release it on their unit.
 
 Suggested initial manual settings, based on the user's observations rather than a manufacturer pressure limit:
 
@@ -20,12 +20,14 @@ Suggested initial manual settings, based on the user's observations rather than 
 2. Enable the optional second pulse of 1 second.
 3. Intermediate pause 1 second; final recovery 2 seconds.
 4. Start and wait for Listo, enable suction, then press Succión for an isolated test outside the body.
-5. Only if the complete sequence actually releases all air without creating vacuum again, press **El ciclo soltó todo el aire** after it finishes. If it fails, leave automatic suction disabled.
-6. Press Start, wait for Listo, then enable **Succión en subidas del script**. Start resets automatic/master enabling but retains the observation while this service instance remains alive.
+5. Only if the complete sequence actually releases all air without creating vacuum again, press **Confirmar liberación comprobada** while Listo. A matching test from an earlier session is sufficient; it does not need to be repeated just to unlock the button. If release fails, leave automatic suction disabled.
+6. Enable **Succión en subidas del script**. This also resumes script output after a local test, without requiring another Start. On later launches: Start, wait for Listo, then enable accents using the restored observation.
 
-The sequence requests command 2 for 2.3 seconds, pump stop for 1 second, command 2 for 1 second, pump stop, then 2 seconds of recovery. This takes approximately 6.3 seconds plus command acceptance delays. The extra pulse is an experimental release attempt, not a known release command. Recovery is a timer, not confirmation of zero pressure. Total requested positive pump time is capped at 5 seconds, including the second pulse. The initial values are adjustable and have not been tested physically on the user's tablet/toy.
+The sequence requests command 2 for 2.3 seconds, pump stop for 1 second, command 2 for 1 second, pump stop, then 2 seconds of recovery. This takes approximately 6.3 seconds plus command acceptance delays. The user reports release with the extra pulse; that is a physical observation on this unit, not identification of a valve-open opcode. Recovery is a timer, not confirmation of zero pressure. Total requested positive pump time is capped at 5 seconds, including the second pulse. Comfort and automatic timing still require physical verification.
 
-Changing command, main duration, intermediate pause, second-pulse selection or recovery invalidates the release observation. Every new manual suction test also clears it. Threshold, minimum interval and vibration-scale changes preserve an observation when pump settings are unchanged, but switch automatic suction off until explicitly re-enabled. The observation is not saved across service restarts. Aborted tests and single pulses cannot unlock automatic repetition. The user confirmation supplies an observation for this setup; it is not live pressure monitoring or a safety guarantee.
+Changing command, main duration, intermediate pause, second-pulse selection or recovery invalidates the release observation. Every new manual suction test also clears it. Threshold, minimum interval and vibration-scale changes preserve an observation when pump settings are unchanged, but switch automatic suction off until explicitly re-enabled. A saved signature binds the user's observation to the command-2 sequence and exact pump timing, and is checked on service creation; missing, incompatible or mismatched signatures do not unlock suction. Uninstalling the app deletes it. Completing or aborting a timer never automatically validates release. The user confirmation supplies an observation for this setup; it is not live pressure monitoring or a safety guarantee.
+
+The automatic switch remains tappable while the bridge is running. The service explains missing confirmation/configuration or an unfinished cycle instead of leaving the control silently grey. It will not start a new cycle while a previous pump stage or recovery is active. Recording an observation still requires command 2, the second pulse and Listo. Start/Stop reset accent enabling while retaining the saved observation. UI duration values are rounded to the nearest millisecond when saved to avoid truncation changes accidentally invalidating the signature.
 
 ## Radio scheduling and vibration
 
@@ -33,7 +35,7 @@ One persistent legacy advertising set is used. Operations are serialized through
 
 The vibration scheduler retains only the newest desired value. Stops and lower vibration commands bypass the 100-ms pacing used for increases, after any in-flight operation completes. Android accepting advertising data is not a toy acknowledgement. Pump-stage durations and recovery start after data acceptance; neither proves radio reception or actual pressure response. UI state broadcasts are limited to 10 per second; skipped-peak logs to one per second, while counts still update.
 
-The default vibration scale remains: 0–2 stop, 3–8 command 1, 9–14 command 2, 15–20 command 3. Turning off **Repartir los modos por el rango completo** restores 3–4 command 1, 5–9 command 2, 10–20 command 3. These are three known command values, not 20 verified physical power levels. Remote vibration expires after 1.2 seconds without a fresh command, so clients that send only changes can stop during long constant segments.
+The default vibration scale remains: 0–2 stop, 3–8 command 1, 9–14 command 2, 15–20 command 3. Turning off **Repartir los modos por el rango completo** restores 3–4 command 1, 5–9 command 2, 10–20 command 3. These are three known command values, not 20 verified physical power levels. The user reports that vibration works correctly in 1.5; this release's changes concern enabling and recording suction configuration. Remote vibration expires after 1.2 seconds without a fresh command, so clients that send only changes can stop during long constant segments.
 
 Local vibration tests pause script outputs and last 2 seconds; inputs 3, 10 and 18 check commands 1, 2 and 3 with the default scale. Manual suction tests first wait for vibration-stop acceptance. Start resumes script reception afterward. `Vibrate` and `Vibrate1` drive the single input; `Rotate` and `Vibrate2` return `ERR`. Explicit protocol Stop also disables automatic accents, requiring re-enabling after a pause that sends Stop.
 
@@ -53,4 +55,4 @@ Use JDK 17:
 
 GitHub Actions runs unit tests and builds the debug APK. A different debug signing key may require uninstalling the previous APK, which removes local settings.
 
-Local verification covers sequence timing, release-confirmation gating, rising crossings, busy/interval skips, serialized pump stages, cancellation, vibration updates and a combined fast-stream simulation with delayed acceptance. Service/controller/transmitter compile against Android API 35. Full Compose UI/APK compilation is delegated to GitHub Actions. Physical suction, release, channel latching, comfort and timing remain unverified on this tablet/toy.
+Local verification covers sequence timing, user-confirmation gating and restoration, setting mismatches, rising crossings, busy/interval skips, serialized pump stages, cancellation, vibration updates and a combined fast-stream simulation with delayed acceptance. Service/controller/transmitter compile against Android API 35. Full Compose UI/APK compilation is delegated to GitHub Actions. The user's successful release and vibration tests are recorded above; automatic suction activation and timing for this revision still need checking on the tablet/toy.

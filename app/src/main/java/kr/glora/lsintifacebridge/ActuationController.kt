@@ -38,6 +38,9 @@ class ActuationController {
     var pumpRevision = 0L
         private set
 
+    val releaseProfile: String? get() = if (scriptCommand == 2 && secondPulseEnabled)
+        "hb2451-c2-v1:$pulseMs:$cooldownMs:$SECOND_PULSE_MS:$recoveryMs" else null
+
     val pumpActive: Boolean get() = phase in listOf(Phase.STARTING, Phase.SUCKING,
         Phase.SECOND_STARTING, Phase.SECOND_PULSE)
     private var pumpDeadline = 0L
@@ -115,10 +118,16 @@ class ActuationController {
     }
 
     fun confirmRelease(): Boolean {
-        if (!manualSequenceCompleted || phase != Phase.IDLE || scriptCommand != 2 || !secondPulseEnabled) return false
+        // Explicit user observation may come from an earlier session, not just the latest timer.
+        if (phase != Phase.IDLE || releaseProfile == null) return false
         releaseVerified = true // The user's observation, not a pressure measurement.
         manualSequenceCompleted = false
         return true
+    }
+
+    fun restoreRelease(profile: String?): Boolean {
+        releaseVerified = profile != null && profile == releaseProfile
+        return releaseVerified
     }
 
     fun automaticPulse(now: Long): Boolean {

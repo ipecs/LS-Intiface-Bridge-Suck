@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kr.glora.lsintifacebridge.ui.theme.LSIntifaceBridgeTheme
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 class MainActivity : ComponentActivity() {
     private var wsUrl by mutableStateOf(DEFAULT_WS_URL)
@@ -58,7 +59,6 @@ class MainActivity : ComponentActivity() {
     private var appliedVibrationLevel by mutableIntStateOf(-1)
     private var peaksEnabled by mutableStateOf(false)
     private var releaseVerified by mutableStateOf(false)
-    private var manualCompleted by mutableStateOf(false)
     private var acceptedPeaks by mutableIntStateOf(0)
     private var skippedPeaks by mutableIntStateOf(0)
     private var peakThreshold by mutableIntStateOf(12)
@@ -98,7 +98,6 @@ class MainActivity : ComponentActivity() {
             suctionEnabled = intent.getBooleanExtra(BridgeService.EXTRA_SUCTION_ENABLED, false)
             peaksEnabled = intent.getBooleanExtra(BridgeService.EXTRA_PEAKS_ENABLED, false)
             releaseVerified = intent.getBooleanExtra(BridgeService.EXTRA_RELEASE_VERIFIED, false)
-            manualCompleted = intent.getBooleanExtra(BridgeService.EXTRA_MANUAL_COMPLETED, false)
             acceptedPeaks = intent.getIntExtra(BridgeService.EXTRA_ACCEPTED_PEAKS, acceptedPeaks)
             skippedPeaks = intent.getIntExtra(BridgeService.EXTRA_SKIPPED_PEAKS, skippedPeaks)
             bridgeRunning = intent.getBooleanExtra(BridgeService.EXTRA_RUNNING, false)
@@ -177,7 +176,7 @@ class MainActivity : ComponentActivity() {
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Switch(checked = peaksEnabled,
-                                enabled = bridgeRunning && (peaksEnabled || (releaseVerified && !remotePaused && phase == "IDLE")),
+                                enabled = bridgeRunning,
                                 onCheckedChange = { enabled ->
                                     startService(Intent(this@MainActivity, BridgeService::class.java)
                                         .setAction(BridgeService.ACTION_TOGGLE_PEAKS)
@@ -208,23 +207,28 @@ class MainActivity : ComponentActivity() {
                                     if (it) pulseSeconds = pulseSeconds.coerceAtMost(4f)
                                     saveConfig()
                                 })
-                            Text("Añadir segundo pulso de 1 s (prueba; comando 2)")
+                            Text("Añadir segundo pulso de 1 s (comando 2)")
                         }
                         Text("Recuperación tras la parada final: %.1f s".format(recoverySeconds))
                         Slider(value = recoverySeconds, onValueChange = { recoverySeconds = it },
                             onValueChangeFinished = { saveConfig() }, valueRange = 1f..5f, steps = 39)
-                        Text("Para habilitar picos: comando 2, segundo pulso activado y prueba manual fuera del cuerpo. Al terminar, confirma sólo si dejó salir todo el aire sin crear vacío otra vez.",
+                        Text("Si ya comprobaste que el ciclo con comando 2 y segundo pulso deja salir todo el aire, guarda esa confirmación. Puede ser una prueba de una sesión anterior.",
                             style = MaterialTheme.typography.bodySmall)
                         Button(onClick = {
                             startService(Intent(this@MainActivity, BridgeService::class.java)
                                 .setAction(BridgeService.ACTION_CONFIRM_RELEASE))
-                        }, enabled = bridgeRunning && manualCompleted && phase == "IDLE" && !releaseVerified) {
-                            Text("El ciclo soltó todo el aire")
+                        }, enabled = bridgeRunning && phase == "IDLE" && testRotateLevel == 2 && secondPulseEnabled && !releaseVerified) {
+                            Text("Confirmar liberación comprobada")
                         }
-                        Text(if (releaseVerified) "Liberación confirmada por ti para estos ajustes. Start y activar subidas."
-                            else "Repetición por script bloqueada hasta comprobar la liberación.",
+                        Text(when {
+                            releaseVerified -> "Liberación guardada para estos ajustes. Activa las subidas para reanudar el script."
+                            testRotateLevel != 2 || !secondPulseEnabled -> "Para habilitar subidas: comando 2 y segundo pulso activado."
+                            !bridgeRunning -> "Pulsa Start para guardar la confirmación y activar subidas."
+                            phase != "IDLE" -> "Espera Listo para confirmar y activar subidas."
+                            else -> "Guarda la liberación que comprobaste y activa las subidas."
+                        },
                             style = MaterialTheme.typography.bodySmall)
-                        Text("Una prueba manual pausa el script hasta Start. Cambiar los tiempos de bomba obliga a comprobar la liberación otra vez.",
+                        Text("Activar subidas también reanuda el script tras una prueba local. La confirmación se conserva al cerrar la app; cambiar los tiempos de bomba la borra.",
                             style = MaterialTheme.typography.bodySmall)
                         Text("Probar primero sin contacto corporal. La parada de la bomba no confirma liberación del vacío.",
                             style = MaterialTheme.typography.bodySmall)
@@ -273,7 +277,7 @@ class MainActivity : ComponentActivity() {
                         }
 
                         Text("WebSocket: $webSocketStatus")
-                        if (remotePaused) Text("Script pausado. Start para reanudar.")
+                        if (remotePaused) Text("Script pausado. Start o activar subidas para reanudar.")
                         Button(onClick = {
                             startService(Intent(this@MainActivity, BridgeService::class.java)
                                 .setAction(BridgeService.ACTION_GLOBAL_STOP))
@@ -369,14 +373,14 @@ class MainActivity : ComponentActivity() {
 
     private fun saveConfig() {
         startService(Intent(this, BridgeService::class.java).setAction(BridgeService.ACTION_CONFIG)
-            .putExtra(BridgeService.EXTRA_PULSE_MS, (pulseSeconds * 1000).toLong())
-            .putExtra(BridgeService.EXTRA_COOLDOWN_MS, (cooldownSeconds * 1000).toLong())
+            .putExtra(BridgeService.EXTRA_PULSE_MS, (pulseSeconds * 1000).roundToLong())
+            .putExtra(BridgeService.EXTRA_COOLDOWN_MS, (cooldownSeconds * 1000).roundToLong())
             .putExtra(BridgeService.EXTRA_FULL_VIBRATION_RANGE, fullVibrationRange)
             .putExtra(BridgeService.EXTRA_SUCTION_COMMAND, testRotateLevel)
             .putExtra(BridgeService.EXTRA_SECOND_PULSE, secondPulseEnabled)
-            .putExtra(BridgeService.EXTRA_RECOVERY_MS, (recoverySeconds * 1000).toLong())
+            .putExtra(BridgeService.EXTRA_RECOVERY_MS, (recoverySeconds * 1000).roundToLong())
             .putExtra(BridgeService.EXTRA_PEAK_THRESHOLD, peakThreshold)
-            .putExtra(BridgeService.EXTRA_PEAK_INTERVAL_MS, (peakIntervalSeconds * 1000).toLong()))
+            .putExtra(BridgeService.EXTRA_PEAK_INTERVAL_MS, (peakIntervalSeconds * 1000).roundToLong()))
     }
 
     private fun requestMissingPermissions() {

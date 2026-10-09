@@ -46,7 +46,7 @@ class BridgeService : Service() {
             if (manual != null && controller.phase == ActuationController.Phase.IDLE &&
                 radio?.confirmed == BleTransmitter.VIBRATION[0] && radio?.hasPendingOperation == false) {
                 pendingManualSuction = null
-                controller.manualPulse(manual, now)
+                if (controller.manualPulse(manual, now)) persistRelease()
             }
             val command = requestCurrentCommand()
             if (radio?.confirmed == command && radio?.hasPendingOperation == false) {
@@ -80,6 +80,8 @@ class BridgeService : Service() {
             command = prefs.getInt("suction_command", 2), secondPulse = prefs.getBoolean("second_pulse", false),
             recovery = prefs.getLong("recovery_ms", 2000L))
         accents.configure(prefs.getInt("peak_threshold", 12), prefs.getLong("peak_interval_ms", 8000L))
+        controller.restoreRelease(prefs.getString("release_profile", null))
+        persistRelease()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -138,10 +140,14 @@ class BridgeService : Service() {
             ACTION_TOGGLE_PEAKS -> {
                 val enabled = intent.getBooleanExtra(EXTRA_PEAKS_ENABLED, false)
                 if (running && !shuttingDown) {
-                    if (enabled && (!controller.releaseVerified || remoteOutputsPaused ||
-                            controller.phase != ActuationController.Phase.IDLE)) {
-                        publish("Para activar picos: comprobar liberación, pulsar Start y esperar Listo", force = true)
+                    if (enabled && !controller.releaseVerified) {
+                        publish(if (controller.releaseProfile == null)
+                            "Selecciona comando 2 y activa el segundo pulso; después confirma la liberación que comprobaste"
+                            else "Pulsa «Confirmar liberación comprobada» para guardar el resultado de tu prueba", force = true)
+                    } else if (enabled && (controller.phase != ActuationController.Phase.IDLE || pendingManualSuction != null)) {
+                        publish("Espera a que figure Listo antes de activar subidas", force = true)
                     } else {
+                        if (enabled) remoteOutputsPaused = false
                         accents.setEnabled(enabled)
                         controller.setSuctionEnabled(enabled, requestIdleStop = false)
                         requestCurrentCommand()
@@ -152,10 +158,11 @@ class BridgeService : Service() {
                 } else if (!running) stopSelf()
             }
             ACTION_CONFIRM_RELEASE -> {
-                if (running && controller.confirmRelease()) {
-                    publish("Liberación confirmada por ti para estos ajustes; Start y activar picos", force = true)
+                if (running && !shuttingDown && pendingManualSuction == null && controller.confirmRelease()) {
+                    persistRelease()
+                    publish("Liberación guardada para estos ajustes; ya puedes activar las subidas", force = true)
                 } else {
-                    publish("Primero completar la prueba manual con comando 2 y segundo pulso", force = true)
+                    publish("Para confirmar: comando 2, segundo pulso activado y estado Listo", force = true)
                     if (!running) stopSelf()
                 }
             }
@@ -174,6 +181,7 @@ class BridgeService : Service() {
                 prefs.edit().putLong("pulse_ms", controller.pulseMs).putLong("cooldown_ms", controller.cooldownMs)
                     .putBoolean("full_vibration_range", controller.fullVibrationRange).putInt("suction_command", controller.scriptCommand)
                     .putBoolean("second_pulse", controller.secondPulseEnabled)
+                    .putString("release_profile", if (controller.releaseVerified) controller.releaseProfile else null)
                     .putLong("recovery_ms", controller.recoveryMs).putInt("peak_threshold", accents.threshold)
                     .putLong("peak_interval_ms", accents.minimumIntervalMs).apply()
                 requestCurrentCommand()
@@ -405,6 +413,10 @@ class BridgeService : Service() {
         socket?.close(1000, "Bridge stopped")
         socket = null
         wsStatus = "Disconnected"
+    }
+
+    private fun persistRelease() {
+        prefs.edit().putString("release_profile", if (controller.releaseVerified) controller.releaseProfile else null).apply()
     }
 
     private fun finishShutdown() {

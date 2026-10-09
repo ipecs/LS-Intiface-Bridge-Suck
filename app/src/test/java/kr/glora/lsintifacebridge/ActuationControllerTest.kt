@@ -260,10 +260,9 @@ class ActuationControllerTest {
         return c
     }
 
-    @Test fun automaticPumpRequiresACompletedManualTestAndUserConfirmation() {
+    @Test fun automaticPumpRequiresUserConfirmationForTheTwoPulseConfiguration() {
         val c = ready(second = true)
         assertFalse(c.automaticPulse(0))
-        assertFalse(c.confirmRelease())
         val tested = completedManualSequence()
         assertFalse(tested.releaseVerified)
         assertFalse(tested.automaticPulse(4600))
@@ -308,20 +307,21 @@ class ActuationControllerTest {
         assertEquals(Phase.BETWEEN_STOPPING, c.phase)
     }
 
-    @Test fun anAbortedManualSequenceCannotBeConfirmedAsRelease() {
+    @Test fun anAbortedManualSequenceDoesNotAutomaticallyValidateRelease() {
         for (stage in listOf(Phase.STARTING, Phase.SUCKING, Phase.BETWEEN_WAIT, Phase.SECOND_PULSE)) {
             val c = atStage(stage)
             c.stopAll()
             c.stopDataApplied(5000)
             c.tick(6000)
             assertFalse("stage=$stage", c.manualSequenceCompleted)
-            assertFalse(c.confirmRelease())
+            assertFalse(c.releaseVerified)
+            assertFalse(c.automaticPulse(6000))
         }
     }
 
     @Test fun aSinglePulseOrDifferentCommandCannotValidateTheTwoPulseSequence() {
         for ((command, second) in listOf(2 to false, 3 to true)) {
-            val c = ready(second = second)
+            val c = ready(command = command, second = second)
             assertTrue(c.manualPulse(command, 0))
             c.pumpDataApplied(command, 0)
             c.tick(700)
@@ -332,7 +332,7 @@ class ActuationControllerTest {
         }
     }
 
-    @Test fun aNewManualTestInvalidatesConfirmationUntilItsOwnCompletion() {
+    @Test fun aNewManualTestClearsObservationAndCannotConfirmWhileRunning() {
         val c = completedManualSequence()
         assertTrue(c.confirmRelease())
         assertTrue(c.manualPulse(2, 4700))
@@ -362,5 +362,63 @@ class ActuationControllerTest {
         assertFalse(c.manualPulse(2, 699))
         c.tick(700)
         assertEquals(Phase.STOPPING, c.phase)
+    }
+
+    @Test fun userCanRecordAnEarlierObservedReleaseWithoutRepeatingTheManualCycle() {
+        val c = ready(second = true)
+        assertFalse(c.manualSequenceCompleted)
+        assertFalse(c.releaseVerified)
+        assertTrue(c.confirmRelease())
+        assertTrue(c.automaticPulse(0))
+    }
+
+    @Test fun storedObservationRestoresForTheExactConfigurationAfterRecreation() {
+        val original = completedManualSequence()
+        assertTrue(original.confirmRelease())
+        val saved = original.releaseProfile
+        val recreated = ready(second = true)
+        recreated.configure(700, 700, 0, command = 2, secondPulse = true, recovery = 2000)
+        assertTrue(recreated.restoreRelease(saved))
+        assertTrue(recreated.releaseVerified)
+        assertTrue(recreated.automaticPulse(0))
+    }
+
+    @Test fun storedObservationCannotUnlockDifferentPumpSettings() {
+        val original = completedManualSequence()
+        assertTrue(original.confirmRelease())
+        for (setting in 0..4) {
+            val recreated = ready(second = true)
+            recreated.configure(if (setting == 0) 800 else 700, if (setting == 1) 800 else 700, 0,
+                command = if (setting == 2) 1 else 2, secondPulse = setting != 3,
+                recovery = if (setting == 4) 3000 else 2000)
+            assertFalse("setting=$setting", recreated.restoreRelease(original.releaseProfile))
+            assertFalse(recreated.automaticPulse(0))
+        }
+    }
+
+    @Test fun missingOrUnknownSavedObservationNeverEnablesThePump() {
+        val c = ready(second = true)
+        for (saved in listOf(null, "", "true", "hb2451-c2-v0:700:700:1000:0")) {
+            assertFalse(c.restoreRelease(saved))
+            assertFalse(c.automaticPulse(0))
+        }
+        assertTrue(c.confirmRelease())
+        assertFalse(c.restoreRelease("unknown"))
+        assertFalse(c.releaseVerified)
+    }
+
+    @Test fun startStopHoldPreservesObservationUntilMasterIsReenabledAndReady() {
+        val c = completedManualSequence()
+        assertTrue(c.confirmRelease())
+        c.setSuctionEnabled(false)
+        c.stopAll()
+        assertTrue(c.releaseVerified)
+        assertFalse(c.automaticPulse(4700))
+        c.stopDataApplied(4700)
+        c.tick(6700)
+        assertTrue(c.releaseVerified)
+        assertFalse(c.automaticPulse(6700))
+        c.setSuctionEnabled(true)
+        assertTrue(c.automaticPulse(6700))
     }
 }
