@@ -15,6 +15,8 @@ import java.util.concurrent.TimeUnit
 class BridgeService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val controller = ActuationController()
+    private val accents = PeakSuctionGate()
+    private val outputs = ActuationOutputRouter()
     private val client = OkHttpClient.Builder().pingInterval(10, TimeUnit.SECONDS).build()
     private var radio: BleTransmitter? = null
     private var socket: WebSocket? = null
@@ -28,8 +30,11 @@ class BridgeService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wsStatus = "Disconnected"
     private var bleStatus = "Idle"
-    private var followsVibration = true
+    private var appliedVibrationLevel = -1
+    private var pendingManualSuction: Int? = null
     private var lastSnapshot = ""
+    private var lastPublishedAt = 0L
+    private var lastPeakSkipLogAt = 0L
     private val prefs by lazy { getSharedPreferences("bridge_settings", MODE_PRIVATE) }
 
     private val loop = object : Runnable {
@@ -37,19 +42,21 @@ class BridgeService : Service() {
             if (!running) return
             val now = SystemClock.elapsedRealtime()
             controller.tick(now)
-            val command = if (controller.phase == ActuationController.Phase.IDLE) {
-                BleTransmitter.VIBRATION[controller.vibrationLevel]
-            } else if (generalStopRequested) {
-                BleTransmitter.GLOBAL_STOP
-            } else {
-                BleTransmitter.SUCTION[controller.suctionLevel]
+            val manual = pendingManualSuction
+            if (manual != null && controller.phase == ActuationController.Phase.IDLE &&
+                radio?.confirmed == BleTransmitter.VIBRATION[0] && radio?.hasPendingOperation == false) {
+                pendingManualSuction = null
+                controller.manualPulse(manual, now)
             }
-            radio?.request(command)
-            if ((command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) &&
-                radio?.confirmed == command && radio?.hasPendingOperation == false) {
-                controller.stopDataApplied(now)
+            val command = requestCurrentCommand()
+            if (radio?.confirmed == command && radio?.hasPendingOperation == false) {
+                acceptPumpStage(command, now)
             }
             if (shuttingDown) {
+                if (stopVibrationAppliedAt == null && controller.phase == ActuationController.Phase.IDLE &&
+                    radio?.confirmed == BleTransmitter.VIBRATION[0] && radio?.hasPendingOperation == false) {
+                    stopVibrationAppliedAt = now
+                }
                 val stoppedAt = stopVibrationAppliedAt
                 if (stoppedAt != null && now - stoppedAt >= 500L) {
                     finishShutdown()
@@ -68,10 +75,11 @@ class BridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        followsVibration = prefs.getBoolean("follow_vibration", true)
+        controller.setFullVibrationRange(prefs.getBoolean("full_vibration_range", true))
         controller.configure(prefs.getLong("pulse_ms", 2300L), prefs.getLong("cooldown_ms", 1000L), now(),
-            prefs.getInt("suction_command", 2), prefs.getInt("trigger_at", 3),
-            prefs.getBoolean("second_pulse", false))
+            command = prefs.getInt("suction_command", 2), secondPulse = prefs.getBoolean("second_pulse", false),
+            recovery = prefs.getLong("recovery_ms", 2000L))
+        accents.configure(prefs.getInt("peak_threshold", 12), prefs.getLong("peak_interval_ms", 8000L))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -80,62 +88,125 @@ class BridgeService : Service() {
             ACTION_START -> {
                 if (shuttingDown) return START_NOT_STICKY
                 if (!ensureRunning()) return START_NOT_STICKY
+                accents.setEnabled(false)
                 controller.setSuctionEnabled(false)
+                pendingManualSuction = null
                 controller.stopAll()
+                requestCurrentCommand()
                 remoteOutputsPaused = false
                 notification()
                 connect(intent.getStringExtra(EXTRA_WS_URL).orEmpty())
             }
             ACTION_STOP, ACTION_GLOBAL_STOP -> if (running) {
+                accents.setEnabled(false)
                 shuttingDown = true
                 generalStopRequested = generalStopRequested || intent.action == ACTION_GLOBAL_STOP
                 shutdownStart = now()
                 stopVibrationAppliedAt = null
                 disconnect()
+                pendingManualSuction = null
                 controller.stopAll(restartHold = intent.action == ACTION_GLOBAL_STOP)
+                requestCurrentCommand()
                 publish(if (generalStopRequested) "Parada general solicitada; liberación del vacío por comprobar"
                     else "Parando ambos canales antes de cerrar la emisión")
             } else stopSelf()
             ACTION_OFF -> if (running) {
+                pendingManualSuction = null
                 remoteOutputsPaused = true
+                accents.setEnabled(false)
                 controller.setSuctionEnabled(false)
                 controller.stopAll()
+                requestCurrentCommand()
                 notification()
                 publish("Off: salidas del script pausadas y succión deshabilitada; Start para reanudar")
             } else stopSelf()
             ACTION_TOGGLE_SUCTION -> {
                 if (running && !shuttingDown) {
-                    controller.setSuctionEnabled(intent.getBooleanExtra(EXTRA_SUCTION_ENABLED, !controller.suctionEnabled))
+                    controller.setSuctionEnabled(intent.getBooleanExtra(EXTRA_SUCTION_ENABLED, !controller.suctionEnabled),
+                        requestIdleStop = false)
+                    if (!controller.suctionEnabled) {
+                        pendingManualSuction = null
+                        accents.setEnabled(false)
+                    }
+                    requestCurrentCommand()
                     notification()
                     publish(if (!controller.suctionEnabled) "Succión deshabilitada"
                         else if (remoteOutputsPaused) "Succión habilitada para pruebas locales; Start para reanudar script"
-                        else "Succión habilitada: esperando pico nuevo")
+                        else "Succión manual habilitada; los picos se activan por separado")
                 } else if (!running) stopSelf()
             }
+            ACTION_TOGGLE_PEAKS -> {
+                val enabled = intent.getBooleanExtra(EXTRA_PEAKS_ENABLED, false)
+                if (running && !shuttingDown) {
+                    if (enabled && (!controller.releaseVerified || remoteOutputsPaused ||
+                            controller.phase != ActuationController.Phase.IDLE)) {
+                        publish("Para activar picos: comprobar liberación, pulsar Start y esperar Listo", force = true)
+                    } else {
+                        accents.setEnabled(enabled)
+                        controller.setSuctionEnabled(enabled, requestIdleStop = false)
+                        requestCurrentCommand()
+                        notification()
+                        publish(if (enabled) "Picos activados: subida a ${accents.threshold}/20; intervalo mínimo ${accents.minimumIntervalMs / 1000}s"
+                            else "Picos desactivados; pasos de bomba pendientes cancelados")
+                    }
+                } else if (!running) stopSelf()
+            }
+            ACTION_CONFIRM_RELEASE -> {
+                if (running && controller.confirmRelease()) {
+                    publish("Liberación confirmada por ti para estos ajustes; Start y activar picos", force = true)
+                } else {
+                    publish("Primero completar la prueba manual con comando 2 y segundo pulso", force = true)
+                    if (!running) stopSelf()
+                }
+            }
             ACTION_CONFIG -> {
-                controller.stopAll(ActuationController.StopReason.SETTINGS_CHANGED)
+                pendingManualSuction = null
+                accents.setEnabled(false)
+                controller.tick(now())
                 controller.configure(intent.getLongExtra(EXTRA_PULSE_MS, controller.pulseMs),
                     intent.getLongExtra(EXTRA_COOLDOWN_MS, controller.cooldownMs), now(),
-                    intent.getIntExtra(EXTRA_SUCTION_COMMAND, controller.scriptCommand),
-                    intent.getIntExtra(EXTRA_TRIGGER_AT, controller.triggerAt),
-                    intent.getBooleanExtra(EXTRA_SECOND_PULSE, controller.secondPulseEnabled))
-                followsVibration = intent.getBooleanExtra(EXTRA_FOLLOW_VIBRATION, followsVibration)
+                    command = intent.getIntExtra(EXTRA_SUCTION_COMMAND, controller.scriptCommand),
+                    secondPulse = intent.getBooleanExtra(EXTRA_SECOND_PULSE, controller.secondPulseEnabled),
+                    recovery = intent.getLongExtra(EXTRA_RECOVERY_MS, controller.recoveryMs))
+                accents.configure(intent.getIntExtra(EXTRA_PEAK_THRESHOLD, accents.threshold),
+                    intent.getLongExtra(EXTRA_PEAK_INTERVAL_MS, accents.minimumIntervalMs))
+                controller.setFullVibrationRange(intent.getBooleanExtra(EXTRA_FULL_VIBRATION_RANGE, controller.fullVibrationRange))
                 prefs.edit().putLong("pulse_ms", controller.pulseMs).putLong("cooldown_ms", controller.cooldownMs)
-                    .putBoolean("follow_vibration", followsVibration).putInt("suction_command", controller.scriptCommand)
-                    .putInt("trigger_at", controller.triggerAt).putBoolean("second_pulse", controller.secondPulseEnabled).apply()
-                publish("Ajustes guardados; ciclo detenido")
+                    .putBoolean("full_vibration_range", controller.fullVibrationRange).putInt("suction_command", controller.scriptCommand)
+                    .putBoolean("second_pulse", controller.secondPulseEnabled)
+                    .putLong("recovery_ms", controller.recoveryMs).putInt("peak_threshold", accents.threshold)
+                    .putLong("peak_interval_ms", accents.minimumIntervalMs).apply()
+                requestCurrentCommand()
+                if (running) notification()
+                publish("Ajustes guardados; reactivar picos si corresponde")
                 if (!running) stopSelf()
             }
             ACTION_TEST_LEVEL -> {
                 if (!shuttingDown && ensureRunning()) {
                     if (intent.hasExtra(EXTRA_VIBRATION_LEVEL)) {
+                        if (controller.phase != ActuationController.Phase.IDLE || pendingManualSuction != null) {
+                            publish("Prueba de vibración pendiente: esperar a que figure Listo")
+                            return START_NOT_STICKY
+                        }
+                        accents.setEnabled(false)
+                        remoteOutputsPaused = true
                         controller.vibration(intent.getIntExtra(EXTRA_VIBRATION_LEVEL, 0), now(), 2000L)
+                        requestVibrationNow()
+                        publish("Prueba de vibración aislada del script durante 2 s; Start para reanudar")
                     }
                     if (intent.hasExtra(EXTRA_ROTATION_LEVEL)) {
                         val level = intent.getIntExtra(EXTRA_ROTATION_LEVEL, 0)
-                        if (level == 0) controller.stopAll()
-                        else if (controller.manualPulse(level, now())) {
+                        if (level == 0) {
+                            pendingManualSuction = null
+                            controller.stopAll()
+                            requestCurrentCommand()
+                        } else if (controller.suctionEnabled && controller.phase == ActuationController.Phase.IDLE &&
+                            pendingManualSuction == null && level in 1..3) {
+                            accents.setEnabled(false)
                             remoteOutputsPaused = true
+                            controller.vibration(0, now())
+                            pendingManualSuction = level
+                            radio?.request(BleTransmitter.VIBRATION[0])
                             publish("Prueba de succión aislada del script; Start para reanudar el script después")
                         } else {
                             publish("Prueba no iniciada: habilitar succión y esperar a que termine el descanso")
@@ -177,24 +248,29 @@ class BridgeService : Service() {
             val now = now()
             controller.tick(now)
             bleStatus = "Android aceptó %06X".format(command)
-            if (command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) controller.stopDataApplied(now)
-            val pumpLevel = BleTransmitter.SUCTION.indexOf(command)
-            if (pumpLevel > 0) controller.pumpDataApplied(pumpLevel, now)
+            val vibrationLevel = BleTransmitter.VIBRATION.indexOf(command)
+            if (vibrationLevel >= 0) appliedVibrationLevel = vibrationLevel
+            synchronizeOutputs(now)
+            acceptPumpStage(command, now)
             if (shuttingDown && command == BleTransmitter.VIBRATION[0] &&
                 controller.phase == ActuationController.Phase.IDLE) stopVibrationAppliedAt = now
-            if (command in BleTransmitter.SUCTION.drop(1) &&
-                !controller.pumpActive) {
-                radio?.request(if (generalStopRequested) BleTransmitter.GLOBAL_STOP else BleTransmitter.SUCTION[0])
-            }
+            requestCurrentCommand()
             publish(bleStatus)
         }, { message ->
+            pendingManualSuction = null
+            accents.setEnabled(false)
+            remoteOutputsPaused = true
             controller.setSuctionEnabled(false)
             controller.stopAll(ActuationController.StopReason.RADIO_FAILURE)
+            requestCurrentCommand()
             bleStatus = "Error BLE"
             notification()
             publish(message)
         })
+        outputs.reset()
+        accents.setEnabled(false)
         controller.stopAll() // Flush the pump stop before accepting activation.
+        appliedVibrationLevel = -1
         running = true
         handler.post(loop)
         return true
@@ -217,7 +293,7 @@ class BridgeService : Service() {
             override fun onOpen(ws: WebSocket, response: Response) = onMain(ws) {
                 wsStatus = "Connected"
                 ws.send("{\"identifier\":\"LVSDevice\",\"address\":\"001122334455\",\"version\":0}")
-                publish("Intiface conectado; perfil Nora para vibración y rotación")
+                publish("Intiface conectado; perfil Hush con un único control de vibración")
             }
             override fun onMessage(ws: WebSocket, text: String) = onMain(ws) {
                 val reply = parser.receive(text)
@@ -228,52 +304,100 @@ class BridgeService : Service() {
                 if (reply.isNotEmpty()) ws.send(reply.encodeUtf8())
             }
             override fun onClosing(ws: WebSocket, code: Int, reason: String) = onMain(ws) {
+                pendingManualSuction = null
+                accents.setEnabled(false)
                 controller.stopAll(ActuationController.StopReason.CONNECTION_LOST)
+                requestCurrentCommand()
                 ws.close(code, reason)
             }
             override fun onClosed(ws: WebSocket, code: Int, reason: String) = onMain(ws) {
-                wsStatus = "Disconnected"; controller.stopAll(ActuationController.StopReason.CONNECTION_LOST); publish("WebSocket cerrado: $reason")
+                pendingManualSuction = null
+                wsStatus = "Disconnected"
+                accents.setEnabled(false)
+                controller.stopAll(ActuationController.StopReason.CONNECTION_LOST)
+                requestCurrentCommand()
+                publish("WebSocket cerrado: $reason")
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) = onMain(ws) {
-                wsStatus = "Error"; controller.stopAll(ActuationController.StopReason.CONNECTION_LOST); publish("Conexión perdida: ${t.message}")
+                pendingManualSuction = null
+                wsStatus = "Error"
+                accents.setEnabled(false)
+                controller.stopAll(ActuationController.StopReason.CONNECTION_LOST)
+                requestCurrentCommand()
+                publish("Conexión perdida: ${t.message}")
             }
         })
         publish("Conectando a Intiface")
     }
 
     private fun handleCommand(name: String, value: Int?): String = when (name) {
-        "devicetype" -> "C:11:001122334455;"
+        "devicetype" -> "Z:11:001122334455;"
         "battery" -> "ERR;" // This broadcast protocol exposes no battery telemetry.
         "status" -> "2;"
         "autoswitch", "rotatechange" -> "OK;"
         "vibrate", "vibrate1" -> {
             if (value == null || value !in 0..20) "ERR;" else {
                 if (!remoteOutputsPaused) {
-                    controller.vibration(value, now())
-                    if (followsVibration) suctionSample(value, stopOnZero = false)
+                    val time = now()
+                    controller.tick(time)
+                    controller.vibration(value, time)
+                    val event = accents.observe(value, time, controller.releaseVerified && controller.suctionEnabled &&
+                        controller.phase == ActuationController.Phase.IDLE && pendingManualSuction == null)
+                    when (event) {
+                        PeakSuctionGate.Event.START -> {
+                            if (controller.automaticPulse(time)) publish("Subida $value/20: ciclo de succión iniciado")
+                        }
+                        PeakSuctionGate.Event.SKIP_BUSY, PeakSuctionGate.Event.SKIP_INTERVAL -> {
+                            if (time - lastPeakSkipLogAt >= 1000L) {
+                                lastPeakSkipLogAt = time
+                                publish("Subida $value/20 omitida: ${if (event == PeakSuctionGate.Event.SKIP_BUSY) "ciclo/recuperación en curso" else "intervalo mínimo"}")
+                            }
+                        }
+                        PeakSuctionGate.Event.NONE -> Unit
+                    }
+                    requestVibrationNow()
+                    publish()
                 }
                 "OK;"
             }
         }
-        "rotate", "vibrate2" -> {
-            if (value == null || value !in 0..20) "ERR;" else {
-                if (!remoteOutputsPaused && !followsVibration) suctionSample(value)
-                "OK;"
-            }
+        "rotate", "vibrate2" -> "ERR;" // The script profile exposes only one vibrator.
+        "stop", "stopdevice", "poweroff" -> {
+            pendingManualSuction = null
+            accents.setEnabled(false)
+            controller.stopAll()
+            requestCurrentCommand()
+            "OK;"
         }
-        "stop", "stopdevice", "poweroff" -> { controller.stopAll(); "OK;" }
         else -> "ERR;"
     }
 
-    private fun suctionSample(value: Int, stopOnZero: Boolean = true) {
-        val previousAccepted = controller.acceptedPeaks
-        val previousSkipped = controller.skippedPeaks
-        controller.suctionInput(value, now(), stopOnZero)
-        if (controller.acceptedPeaks > previousAccepted) {
-            publish("Subida $value/20: disparo de comando ${controller.scriptCommand}")
-        } else if (controller.skippedPeaks > previousSkipped) {
-            publish("Subida $value/20 omitida: secuencia ocupada")
+    private fun requestVibrationNow() {
+        if (running && pendingManualSuction == null) requestCurrentCommand()
+    }
+
+    private fun synchronizeOutputs(time: Long): Int {
+        val pump = if (controller.phase == ActuationController.Phase.IDLE) null
+            else if (generalStopRequested) BleTransmitter.GLOBAL_STOP
+            else BleTransmitter.SUCTION[controller.suctionLevel]
+        return outputs.select(BleTransmitter.VIBRATION[controller.vibrationLevel], pump,
+            controller.pumpRevision, time)
+    }
+
+    private fun acceptPumpStage(command: Int, time: Long) {
+        if (!outputs.applied(command, time)) return
+        if (command == BleTransmitter.SUCTION[0] || command == BleTransmitter.GLOBAL_STOP) {
+            controller.stopDataApplied(time)
+        } else {
+            val level = BleTransmitter.SUCTION.indexOf(command)
+            if (level > 0) controller.pumpDataApplied(level, time)
         }
+    }
+
+    private fun requestCurrentCommand(): Int {
+        val command = synchronizeOutputs(now())
+        radio?.request(command)
+        return command
     }
 
     private fun disconnect() {
@@ -304,34 +428,40 @@ class BridgeService : Service() {
         }
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LS Intiface Bridge")
-            .setContentText(if (controller.suctionEnabled) "Succión habilitada" else "Solo vibración")
+            .setContentText(if (accents.enabled) "Vibración y acentos de succión en subidas a ${accents.threshold}/20"
+                else "Vibración; succión manual ${if (controller.suctionEnabled) "habilitada" else "apagada"}")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(PendingIntent.getActivity(this, 3, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-            .addAction(action(if (controller.suctionEnabled) "Desactivar succión" else "Habilitar succión", 1, ACTION_TOGGLE_SUCTION))
+            .addAction(action(if (controller.suctionEnabled) "Desactivar prueba" else "Habilitar prueba manual", 1, ACTION_TOGGLE_SUCTION))
             .addAction(action("Parar", 0, ACTION_STOP)).setOngoing(true).build()
         startForeground(NOTIFICATION_ID, notification)
     }
 
     private fun publish(log: String = "", force: Boolean = false) {
-        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.suctionLevel}|${controller.phase}|${controller.stopReason}|${controller.suctionEnabled}|$running|$remoteOutputsPaused|${controller.suctionInputValue}|${controller.acceptedPeaks}|${controller.skippedPeaks}"
+        val snapshot = "$wsStatus|$bleStatus|${controller.vibrationInput}|${controller.vibrationLevel}|${controller.suctionLevel}|${controller.phase}|${controller.stopReason}|${controller.suctionEnabled}|$running|$remoteOutputsPaused|$appliedVibrationLevel|$pendingManualSuction|${accents.enabled}|${accents.accepted}|${accents.skipped}|${controller.releaseVerified}|${controller.manualSequenceCompleted}"
         if (!force && log.isEmpty() && snapshot == lastSnapshot) return
+        val time = now()
+        if (!force && log.isEmpty() && time - lastPublishedAt < 100L) return
+        lastPublishedAt = time
         lastSnapshot = snapshot
         sendBroadcast(Intent(ACTION_STATUS).setPackage(packageName)
             .putExtra(EXTRA_WS_STATUS, wsStatus).putExtra(EXTRA_BLE_STATUS, bleStatus)
             .putExtra(EXTRA_LEVEL, controller.vibrationLevel)
+            .putExtra(EXTRA_APPLIED_VIBRATION_LEVEL, appliedVibrationLevel)
             .putExtra(EXTRA_VIBRATION_LEVEL, controller.vibrationInput)
             .putExtra(EXTRA_ROTATION_LEVEL, controller.suctionLevel)
             .putExtra(EXTRA_SUCTION_ENABLED, controller.suctionEnabled)
+            .putExtra(EXTRA_PEAKS_ENABLED, accents.enabled)
+            .putExtra(EXTRA_RELEASE_VERIFIED, controller.releaseVerified)
+            .putExtra(EXTRA_MANUAL_COMPLETED, controller.manualSequenceCompleted)
+            .putExtra(EXTRA_ACCEPTED_PEAKS, accents.accepted).putExtra(EXTRA_SKIPPED_PEAKS, accents.skipped)
             .putExtra(EXTRA_REMOTE_PAUSED, remoteOutputsPaused)
-            .putExtra(EXTRA_SUCTION_INPUT, controller.suctionInputValue)
-            .putExtra(EXTRA_ACCEPTED_PEAKS, controller.acceptedPeaks)
-            .putExtra(EXTRA_SKIPPED_PEAKS, controller.skippedPeaks)
-            .putExtra(EXTRA_PHASE, controller.phase.name).putExtra(EXTRA_RUNNING, running)
+            .putExtra(EXTRA_PHASE, if (pendingManualSuction != null) "MANUAL_PREPARING" else controller.phase.name)
+            .putExtra(EXTRA_RUNNING, running)
             .putExtra(EXTRA_STOP_REASON, when (controller.stopReason) {
                 ActuationController.StopReason.NONE -> "—"
                 ActuationController.StopReason.PULSE_LIMIT -> "Tiempo de pulso cumplido"
-                ActuationController.StopReason.SEQUENCE_COMPLETE -> "Segundo pulso de prueba terminado"
-                ActuationController.StopReason.ZERO_COMMAND -> "Orden Rotate:0"
+                ActuationController.StopReason.SEQUENCE_COMPLETE -> "Segundo pulso terminado; recuperación"
                 ActuationController.StopReason.DISABLED -> "Succión deshabilitada"
                 ActuationController.StopReason.SETTINGS_CHANGED -> "Cambio de ajustes"
                 ActuationController.StopReason.MANUAL_STOP -> "Orden de parada"
@@ -359,6 +489,8 @@ class BridgeService : Service() {
         const val ACTION_STATUS = "kr.glora.lsintifacebridge.ACTION_STATUS"
         const val ACTION_TEST_LEVEL = "kr.glora.lsintifacebridge.ACTION_TEST_LEVEL"
         const val ACTION_TOGGLE_SUCTION = "kr.glora.lsintifacebridge.ACTION_TOGGLE_SUCTION"
+        const val ACTION_TOGGLE_PEAKS = "kr.glora.lsintifacebridge.ACTION_TOGGLE_PEAKS"
+        const val ACTION_CONFIRM_RELEASE = "kr.glora.lsintifacebridge.ACTION_CONFIRM_RELEASE"
         const val ACTION_CONFIG = "kr.glora.lsintifacebridge.ACTION_CONFIG"
         const val ACTION_OFF = "kr.glora.lsintifacebridge.ACTION_OFF"
         const val ACTION_GLOBAL_STOP = "kr.glora.lsintifacebridge.ACTION_GLOBAL_STOP"
@@ -373,11 +505,16 @@ class BridgeService : Service() {
         const val EXTRA_SUCTION_ENABLED = "suction_enabled"
         const val EXTRA_PULSE_MS = "pulse_ms"
         const val EXTRA_COOLDOWN_MS = "cooldown_ms"
-        const val EXTRA_FOLLOW_VIBRATION = "follow_vibration"
+        const val EXTRA_FULL_VIBRATION_RANGE = "full_vibration_range"
+        const val EXTRA_APPLIED_VIBRATION_LEVEL = "applied_vibration_level"
         const val EXTRA_SUCTION_COMMAND = "suction_command"
-        const val EXTRA_TRIGGER_AT = "trigger_at"
         const val EXTRA_SECOND_PULSE = "second_pulse"
-        const val EXTRA_SUCTION_INPUT = "suction_input"
+        const val EXTRA_PEAKS_ENABLED = "peaks_enabled"
+        const val EXTRA_PEAK_THRESHOLD = "peak_threshold"
+        const val EXTRA_PEAK_INTERVAL_MS = "peak_interval_ms"
+        const val EXTRA_RECOVERY_MS = "recovery_ms"
+        const val EXTRA_RELEASE_VERIFIED = "release_verified"
+        const val EXTRA_MANUAL_COMPLETED = "manual_completed"
         const val EXTRA_ACCEPTED_PEAKS = "accepted_peaks"
         const val EXTRA_SKIPPED_PEAKS = "skipped_peaks"
         const val EXTRA_PHASE = "phase"

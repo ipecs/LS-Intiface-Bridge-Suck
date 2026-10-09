@@ -12,8 +12,8 @@ android {
         applicationId = "kr.glora.lsintifacebridge"
         minSdk = 31
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3-sequenced"
+        versionCode = 6
+        versionName = "1.5-peak-suction"
     }
 
     buildTypes {

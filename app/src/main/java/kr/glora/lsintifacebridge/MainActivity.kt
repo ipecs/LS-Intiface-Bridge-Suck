@@ -54,12 +54,17 @@ class MainActivity : ComponentActivity() {
     private var phase by mutableStateOf("IDLE")
     private var stopReason by mutableStateOf("—")
     private var remotePaused by mutableStateOf(false)
-    private var followsVibration by mutableStateOf(true)
-    private var secondPulseEnabled by mutableStateOf(false)
-    private var triggerAt by mutableIntStateOf(3)
-    private var suctionInputValue by mutableIntStateOf(0)
+    private var fullVibrationRange by mutableStateOf(true)
+    private var appliedVibrationLevel by mutableIntStateOf(-1)
+    private var peaksEnabled by mutableStateOf(false)
+    private var releaseVerified by mutableStateOf(false)
+    private var manualCompleted by mutableStateOf(false)
     private var acceptedPeaks by mutableIntStateOf(0)
     private var skippedPeaks by mutableIntStateOf(0)
+    private var peakThreshold by mutableIntStateOf(12)
+    private var peakIntervalSeconds by mutableStateOf(8f)
+    private var recoverySeconds by mutableStateOf(2f)
+    private var secondPulseEnabled by mutableStateOf(false)
     private var pulseSeconds by mutableStateOf(2.3f)
     private var cooldownSeconds by mutableStateOf(1.0f)
     private var logText by mutableStateOf("")
@@ -91,13 +96,16 @@ class MainActivity : ComponentActivity() {
             vibeLovenseLevel = intent.getIntExtra(BridgeService.EXTRA_VIBRATION_LEVEL, vibeLovenseLevel)
             rotateLovenseLevel = intent.getIntExtra(BridgeService.EXTRA_ROTATION_LEVEL, rotateLovenseLevel)
             suctionEnabled = intent.getBooleanExtra(BridgeService.EXTRA_SUCTION_ENABLED, false)
+            peaksEnabled = intent.getBooleanExtra(BridgeService.EXTRA_PEAKS_ENABLED, false)
+            releaseVerified = intent.getBooleanExtra(BridgeService.EXTRA_RELEASE_VERIFIED, false)
+            manualCompleted = intent.getBooleanExtra(BridgeService.EXTRA_MANUAL_COMPLETED, false)
+            acceptedPeaks = intent.getIntExtra(BridgeService.EXTRA_ACCEPTED_PEAKS, acceptedPeaks)
+            skippedPeaks = intent.getIntExtra(BridgeService.EXTRA_SKIPPED_PEAKS, skippedPeaks)
             bridgeRunning = intent.getBooleanExtra(BridgeService.EXTRA_RUNNING, false)
             phase = intent.getStringExtra(BridgeService.EXTRA_PHASE) ?: phase
             stopReason = intent.getStringExtra(BridgeService.EXTRA_STOP_REASON) ?: stopReason
             remotePaused = intent.getBooleanExtra(BridgeService.EXTRA_REMOTE_PAUSED, false)
-            suctionInputValue = intent.getIntExtra(BridgeService.EXTRA_SUCTION_INPUT, 0)
-            acceptedPeaks = intent.getIntExtra(BridgeService.EXTRA_ACCEPTED_PEAKS, 0)
-            skippedPeaks = intent.getIntExtra(BridgeService.EXTRA_SKIPPED_PEAKS, 0)
+            appliedVibrationLevel = intent.getIntExtra(BridgeService.EXTRA_APPLIED_VIBRATION_LEVEL, -1)
             intent.getStringExtra(BridgeService.EXTRA_LOG)?.takeIf { it.isNotBlank() }?.let(::appendLog)
         }
     }
@@ -105,13 +113,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         wsUrl = preferences().getString(PREF_WS_URL, DEFAULT_WS_URL) ?: DEFAULT_WS_URL
-        followsVibration = preferences().getBoolean("follow_vibration", true)
+        fullVibrationRange = preferences().getBoolean("full_vibration_range", true)
         testRotateLevel = preferences().getInt("suction_command", 2).coerceIn(1, 3)
-        triggerAt = preferences().getInt("trigger_at", 3).coerceIn(1, 20)
         secondPulseEnabled = preferences().getBoolean("second_pulse", false) && testRotateLevel == 2
         pulseSeconds = (preferences().getLong("pulse_ms", 2300L) / 1000f)
             .coerceIn(0.7f, if (secondPulseEnabled) 4f else 5f)
-        cooldownSeconds = preferences().getLong("cooldown_ms", 1000L) / 1000f
+        cooldownSeconds = (preferences().getLong("cooldown_ms", 1000L) / 1000f).coerceIn(0.7f, 5f)
+        peakThreshold = preferences().getInt("peak_threshold", 12).coerceIn(3, 20)
+        peakIntervalSeconds = (preferences().getLong("peak_interval_ms", 8000L) / 1000f).coerceIn(6f, 30f)
+        recoverySeconds = (preferences().getLong("recovery_ms", 2000L) / 1000f).coerceIn(1f, 5f)
         requestMissingPermissions()
 
         setContent {
@@ -146,6 +156,16 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
+                        Text("La vibración sigue el script. La bomba añade ciclos completos en subidas elegidas.")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Switch(checked = fullVibrationRange, onCheckedChange = {
+                                fullVibrationRange = it; saveConfig()
+                            })
+                            Text("Repartir los modos por el rango completo")
+                        }
+                        Text(if (fullVibrationRange) "0–2: apagado | 3–8: modo 1 | 9–14: modo 2 | 15–20: modo 3"
+                            else "Escala anterior: 0–2 apagado | 3–4 modo 1 | 5–9 modo 2 | 10–20 modo 3")
+
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Switch(checked = suctionEnabled, enabled = bridgeRunning,
                                 onCheckedChange = { enabled ->
@@ -156,23 +176,29 @@ class MainActivity : ComponentActivity() {
                             Text("Habilitar succión")
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Switch(checked = followsVibration, onCheckedChange = {
-                                followsVibration = it; saveConfig()
-                            })
-                            Text("Succión desde la señal de vibración")
+                            Switch(checked = peaksEnabled,
+                                enabled = bridgeRunning && (peaksEnabled || (releaseVerified && !remotePaused && phase == "IDLE")),
+                                onCheckedChange = { enabled ->
+                                    startService(Intent(this@MainActivity, BridgeService::class.java)
+                                        .setAction(BridgeService.ACTION_TOGGLE_PEAKS)
+                                        .putExtra(BridgeService.EXTRA_PEAKS_ENABLED, enabled))
+                                })
+                            Text("Succión en subidas del script")
                         }
-                        Text(if (followsVibration) "Un solo script: disparos desde la intensidad recibida."
-                            else "Dos controles: Vibrate y Rotate independientes.")
-                        Text("Umbral de succión: $triggerAt / 20")
-                        Slider(value = triggerAt.toFloat(), onValueChange = { triggerAt = it.roundToInt() },
-                            onValueChangeFinished = { saveConfig() }, valueRange = 1f..20f, steps = 18)
-                        Text("Disparo en subida: alcanzar el umbral después de subir al menos ${minOf(2, triggerAt)} puntos.")
-                        Text("Duración máxima del pulso: %.1f s".format(pulseSeconds))
+                        Text("Disparar al subir a $peakThreshold/20; volver a armar al bajar a ${(peakThreshold - 4).coerceAtLeast(0)} o menos.")
+                        Slider(value = peakThreshold.toFloat(), onValueChange = { peakThreshold = it.roundToInt() },
+                            onValueChangeFinished = { saveConfig() }, valueRange = 3f..20f, steps = 16)
+                        Text("Intervalo mínimo entre inicios: %.0f s".format(peakIntervalSeconds))
+                        Slider(value = peakIntervalSeconds, onValueChange = { peakIntervalSeconds = it },
+                            onValueChangeFinished = { saveConfig() }, valueRange = 6f..30f, steps = 23)
+                        Text("La bajada del script no corta el pulso. Las subidas recibidas durante el ciclo, la recuperación o el intervalo mínimo se omiten.",
+                            style = MaterialTheme.typography.bodySmall)
+                        Text("Duración del pulso principal: %.1f s".format(pulseSeconds))
                         Slider(value = pulseSeconds, onValueChange = { pulseSeconds = it },
                             onValueChangeFinished = { saveConfig() },
                             valueRange = 0.7f..(if (secondPulseEnabled) 4f else 5f),
                             steps = if (secondPulseEnabled) 32 else 42)
-                        Text("Pausa entre pulsos y descanso final: %.1f s".format(cooldownSeconds))
+                        Text("Pausa antes del segundo pulso: %.1f s".format(cooldownSeconds))
                         Slider(value = cooldownSeconds, onValueChange = { cooldownSeconds = it },
                             onValueChangeFinished = { saveConfig() }, valueRange = 0.7f..5f, steps = 42)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -184,7 +210,21 @@ class MainActivity : ComponentActivity() {
                                 })
                             Text("Añadir segundo pulso de 1 s (prueba; comando 2)")
                         }
-                        Text("Durante toda la secuencia se omiten los picos nuevos. El segundo pulso es una prueba de liberación; verificar primero fuera del cuerpo.",
+                        Text("Recuperación tras la parada final: %.1f s".format(recoverySeconds))
+                        Slider(value = recoverySeconds, onValueChange = { recoverySeconds = it },
+                            onValueChangeFinished = { saveConfig() }, valueRange = 1f..5f, steps = 39)
+                        Text("Para habilitar picos: comando 2, segundo pulso activado y prueba manual fuera del cuerpo. Al terminar, confirma sólo si dejó salir todo el aire sin crear vacío otra vez.",
+                            style = MaterialTheme.typography.bodySmall)
+                        Button(onClick = {
+                            startService(Intent(this@MainActivity, BridgeService::class.java)
+                                .setAction(BridgeService.ACTION_CONFIRM_RELEASE))
+                        }, enabled = bridgeRunning && manualCompleted && phase == "IDLE" && !releaseVerified) {
+                            Text("El ciclo soltó todo el aire")
+                        }
+                        Text(if (releaseVerified) "Liberación confirmada por ti para estos ajustes. Start y activar subidas."
+                            else "Repetición por script bloqueada hasta comprobar la liberación.",
+                            style = MaterialTheme.typography.bodySmall)
+                        Text("Una prueba manual pausa el script hasta Start. Cambiar los tiempos de bomba obliga a comprobar la liberación otra vez.",
                             style = MaterialTheme.typography.bodySmall)
                         Text("Probar primero sin contacto corporal. La parada de la bomba no confirma liberación del vacío.",
                             style = MaterialTheme.typography.bodySmall)
@@ -202,7 +242,7 @@ class MainActivity : ComponentActivity() {
 
                         // Rotation Test Control
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text("Comando de succión para script y prueba: $testRotateLevel")
+                            Text("Comando para la prueba manual de succión: $testRotateLevel")
                             Slider(
                                 value = testRotateLevel.toFloat(),
                                 onValueChange = {
@@ -220,10 +260,11 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
-                            Button(onClick = { testVibration(testVibeLevel) }) {
+                            Button(onClick = { testVibration(testVibeLevel) }, enabled = bridgeRunning && phase == "IDLE") {
                                 Text("Vib")
                             }
-                            Button(onClick = { testRotation(testRotateLevel) }) {
+                            Button(onClick = { testRotation(testRotateLevel) },
+                                enabled = bridgeRunning && suctionEnabled && phase == "IDLE") {
                                 Text("Succión")
                             }
                             Button(onClick = { stopAll() }) {
@@ -239,6 +280,7 @@ class MainActivity : ComponentActivity() {
                         }, enabled = bridgeRunning) { Text("Parada general y cerrar puente") }
                         Text("BLE: $bleStatus")
                         val phaseLabel = when (phase) {
+                            "MANUAL_PREPARING" -> "Preparando prueba manual"
                             "STARTING" -> "Esperando inicio"
                             "SUCKING" -> "Pulso principal"
                             "BETWEEN_STOPPING" -> "Parando entre pulsos"
@@ -246,12 +288,13 @@ class MainActivity : ComponentActivity() {
                             "SECOND_STARTING" -> "Esperando segundo pulso"
                             "SECOND_PULSE" -> "Segundo pulso de prueba"
                             "STOPPING" -> "Parando"
-                            "COOLDOWN" -> "Descanso"
+                            "COOLDOWN" -> "Recuperación; no confirma liberación"
                             else -> "Listo"
                         }
-                        Text("Orden: Vib $vibeLovenseLevel / Succión $rotateLovenseLevel | $phaseLabel")
-                        Text("Entrada succión: $suctionInputValue / 20")
-                        Text("Disparos: $acceptedPeaks | Picos omitidos mientras estaba ocupado: $skippedPeaks")
+                        Text("Entrada: $vibeLovenseLevel / 20 → modo de vibración $currentLevel / 3")
+                        Text("Último modo aceptado por Android: ${if (appliedVibrationLevel < 0) "sin confirmar" else appliedVibrationLevel.toString()}")
+                        Text("Succión: $rotateLovenseLevel | $phaseLabel")
+                        Text("Ciclos por subida: $acceptedPeaks | Subidas omitidas: $skippedPeaks")
                         Text("Causa de parada: $stopReason")
                         Spacer(Modifier.height(4.dp))
                         Text(
@@ -318,14 +361,6 @@ class MainActivity : ComponentActivity() {
         ContextCompat.startForegroundService(this, intent)
     }
 
-    private fun testBoth(vibeLevel: Int, rotateLevel: Int) {
-        val intent = Intent(this, BridgeService::class.java)
-            .setAction(BridgeService.ACTION_TEST_LEVEL)
-            .putExtra(BridgeService.EXTRA_VIBRATION_LEVEL, vibeLevel)
-            .putExtra(BridgeService.EXTRA_ROTATION_LEVEL, rotateLevel)
-        ContextCompat.startForegroundService(this, intent)
-    }
-
     private fun stopAll() {
         val intent = Intent(this, BridgeService::class.java)
             .setAction(BridgeService.ACTION_OFF)
@@ -336,10 +371,12 @@ class MainActivity : ComponentActivity() {
         startService(Intent(this, BridgeService::class.java).setAction(BridgeService.ACTION_CONFIG)
             .putExtra(BridgeService.EXTRA_PULSE_MS, (pulseSeconds * 1000).toLong())
             .putExtra(BridgeService.EXTRA_COOLDOWN_MS, (cooldownSeconds * 1000).toLong())
-            .putExtra(BridgeService.EXTRA_FOLLOW_VIBRATION, followsVibration)
+            .putExtra(BridgeService.EXTRA_FULL_VIBRATION_RANGE, fullVibrationRange)
             .putExtra(BridgeService.EXTRA_SUCTION_COMMAND, testRotateLevel)
-            .putExtra(BridgeService.EXTRA_TRIGGER_AT, triggerAt)
-            .putExtra(BridgeService.EXTRA_SECOND_PULSE, secondPulseEnabled))
+            .putExtra(BridgeService.EXTRA_SECOND_PULSE, secondPulseEnabled)
+            .putExtra(BridgeService.EXTRA_RECOVERY_MS, (recoverySeconds * 1000).toLong())
+            .putExtra(BridgeService.EXTRA_PEAK_THRESHOLD, peakThreshold)
+            .putExtra(BridgeService.EXTRA_PEAK_INTERVAL_MS, (peakIntervalSeconds * 1000).toLong()))
     }
 
     private fun requestMissingPermissions() {
